@@ -81,7 +81,7 @@ export async function signup(req: any, res: any) {
                         TOKEN_SECRET,
                         { expiresIn: "24h" }
                     );
-                    const setupLink = `https://enviguide.nextechltd.in/reset-password?token=${token}&setup=1`;
+                    const setupLink = `${process.env.FRONTEND_URL || "https://enviraan.com"}/reset-password?token=${token}&setup=1`;
                     const subject = "Welcome to EnviGuide — Set up your account";
                     const html = `
 <!DOCTYPE html>
@@ -862,7 +862,7 @@ export async function forgotPassword(req: any, res: any) {
         }
         const token = generateAccessToken({ user_email: findUser.rows[0].user_email });
 
-        const resetLink = `https://enviguide.nextechltd.in/reset-password?token=${token}`;
+        const resetLink = `${process.env.FRONTEND_URL || "https://enviraan.com"}/reset-password?token=${token}`;
         const subject = "Password Reset Request - Enviguide";
 
         const html = `
@@ -1007,7 +1007,7 @@ export async function forgotMFA(req: any, res: any) {
             return res.status(400).send(generateResponse(false, 'User with this email does not exist', 400, null));
         }
         const token = generateAccessTokenForResetPassAndMFA({ user_email: findUser.rows[0].user_email });
-        const resetLink = `https://enviguide.nextechltd.in/reset-mfa?token=${token}`;
+        const resetLink = `${process.env.FRONTEND_URL || "https://enviraan.com"}/reset-mfa?token=${token}`;
         const subject = "Reset Your Enviguide MFA";
 
         const to = req.body.user_email;

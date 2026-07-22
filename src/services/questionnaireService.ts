@@ -136,7 +136,14 @@ export interface QuestionnaireInput {
     sites?: SiteRow[];
     bom?: BomRow[];
     coProducts?: CoProductRow[];
+    // Q8b — process consumable materials (auxiliaries) used in production, not in
+    // the BOM. Emission = mass-allocated per component × EF, added to the total.
+    processConsumables?: ProcessConsumableRow[];
     electricity?: ElectricityRow[];
+    // Q10a (per-product factory weight) + Q10b (per-product units). Summed Q10a
+    // = factory total weight (allocation denominator); Q10b = units per product.
+    factoryProductWeights?: FactoryProductWeightRow[];
+    factoryProductUnits?: FactoryProductUnitRow[];
     fuels?: FuelRow[];
     processGases?: ProcessGasRow[];
     qcItEnergy?: QcItRow[];
@@ -151,10 +158,13 @@ export interface QuestionnaireInput {
 export interface SiteRow { siteName?: string; siteAddress?: string; region?: string; country?: string; countrySubdivision?: string; isPrimary?: boolean; notes?: string; }
 export interface BomRow { productIdOrMpn?: string; componentName?: string; material?: string; subCategory?: string; materialGroup?: string; specificType?: string; process?: string; massPct?: number; carbonPct?: number; biogenicYN?: boolean; biogenicCarbonPct?: number; recycledYN?: boolean; recycledCarbonPct?: number; }
 export interface CoProductRow { mpn?: string; componentName?: string; coProductName?: string; coProductPrice?: number; priceCurrency?: string; isPrimaryProduct?: boolean; }
-export interface ElectricityRow { electricityType?: string; generatorType?: string; category?: string; subCategory?: string; materialGroup?: string; specificType?: string; quantity?: number; unit?: string; renewablePct?: number; renewableSourcing?: string; infrastructureEmissionsIncluded?: boolean; }
+export interface ElectricityRow { electricityType?: string; generatorType?: string; category?: string; subCategory?: string; materialGroup?: string; specificType?: string; geography?: string; quantity?: number; unit?: string; renewablePct?: number; renewableSourcing?: string; infrastructureEmissionsIncluded?: boolean; }
+export interface FactoryProductWeightRow { mpn?: string; totalWeightKg?: number; }
+export interface FactoryProductUnitRow { mpn?: string; unitsProduced?: number; }
+export interface ProcessConsumableRow { mpn?: string; consumableMaterial?: string; category?: string; subCategory?: string; materialGroup?: string; specificType?: string; totalQuantity?: number; unit?: string; }
 export interface FuelRow { fuelCarrier?: string; category?: string; subCategory?: string; materialGroup?: string; specificType?: string; quantity?: number; unit?: string; biogenicYN?: boolean; }
 export interface ProcessGasRow { directProcessGas?: string; quantity?: number; unit?: string; fossilOrBiogenic?: string; }
-export interface QcItRow { item?: string; category?: string; subCategory?: string; materialGroup?: string; specificType?: string; value?: number; unit?: string; alreadyInQ10?: boolean; }
+export interface QcItRow { item?: string; category?: string; subCategory?: string; materialGroup?: string; specificType?: string; geography?: string; value?: number; unit?: string; alreadyInQ10?: boolean; }
 export interface WasteRow { productIdOrMpn?: string; componentName?: string; wasteType?: string; treatmentType?: string; category?: string; subCategory?: string; materialGroup?: string; specificType?: string; quantity?: number; unit?: string; energyRecovered?: boolean; polluterPaysApplied?: boolean; }
 export interface PackagingMaterialRow { productIdOrMpn?: string; componentName?: string; packagingType?: string; processType?: string; category?: string; subCategory?: string; materialGroup?: string; specificType?: string; packagingWeight?: number; unit?: string; region?: string; country?: string; recycledPct?: number; carbonBiogenicPct?: number; }
 export interface PackagingTransportRow { packagingProductIdOrMpn?: string; componentName?: string; transportMode?: string; category?: string; subCategory?: string; materialGroup?: string; specificType?: string; weight?: number; unit?: string; distanceKm?: number; }
@@ -180,7 +190,25 @@ export interface SaveResult {
 // Save (UPSERT in one transaction)
 // ============================================================
 
+// Q5 — reference period end completes one financial year from the start:
+// end = start + 1 year − 1 day. The form derives this and sends it, but we
+// derive it defensively here too so an end is always present when a start is.
+// UTC arithmetic avoids DST/local-offset day shifts.
+function deriveReferencePeriodEnd(start?: string): string | undefined {
+    if (!start) return undefined;
+    const d = new Date(start);
+    if (isNaN(d.getTime())) return undefined;
+    const end = new Date(Date.UTC(d.getUTCFullYear() + 1, d.getUTCMonth(), d.getUTCDate()));
+    end.setUTCDate(end.getUTCDate() - 1);
+    return end.toISOString().slice(0, 10);
+}
+
 export async function saveQuestionnaire(input: QuestionnaireInput): Promise<SaveResult> {
+    // Backfill the auto-derived reference end if the client didn't send one.
+    if (!input.referencePeriodEnd && input.referencePeriodStart) {
+        input.referencePeriodEnd = deriveReferencePeriodEnd(input.referencePeriodStart);
+    }
+
     const errors = validateForSave(input);
     if (errors.length > 0) {
         throw new ValidationException(errors);
@@ -394,13 +422,36 @@ export async function saveQuestionnaire(input: QuestionnaireInput): Promise<Save
             await replaceChildTable(client, "sq_q10_electricity", responseId, input.electricity ?? [], (row, i) => [
                 row.electricityType ?? null, row.generatorType ?? null,
                 row.category ?? null, row.subCategory ?? null, row.materialGroup ?? null, row.specificType ?? null,
+                row.geography ?? null,
                 row.quantity ?? null, row.unit ?? null,
                 row.renewablePct ?? null, row.renewableSourcing ?? null, row.infrastructureEmissionsIncluded ?? null, i,
             ], [
                 "electricity_type", "generator_type",
                 "category", "sub_category", "group_name", "specific_type",
+                "geography",
                 "quantity", "unit",
                 "renewable_pct", "renewable_sourcing", "infrastructure_emissions_included", "row_order",
+            ]);
+
+            // Q10a — per-product total weight produced at the factory (summed →
+            // allocation denominator). Q10b — units produced per product.
+            await replaceChildTable(client, "sq_q10a_factory_weights", responseId, input.factoryProductWeights ?? [], (row, i) => [
+                row.mpn ?? null, row.totalWeightKg ?? null, i,
+            ], ["mpn", "total_weight_kg", "row_order"]);
+
+            await replaceChildTable(client, "sq_q10b_factory_units", responseId, input.factoryProductUnits ?? [], (row, i) => [
+                row.mpn ?? null, row.unitsProduced ?? null, i,
+            ], ["mpn", "units_produced", "row_order"]);
+
+            // Q8b — process consumable materials (auxiliaries).
+            await replaceChildTable(client, "sq_q8b_process_consumables", responseId, input.processConsumables ?? [], (row, i) => [
+                row.mpn ?? null, row.consumableMaterial ?? null,
+                row.category ?? null, row.subCategory ?? null, row.materialGroup ?? null, row.specificType ?? null,
+                row.totalQuantity ?? null, row.unit ?? null, i,
+            ], [
+                "mpn", "consumable_material",
+                "category", "sub_category", "group_name", "specific_type",
+                "total_quantity", "unit", "row_order",
             ]);
 
             await replaceChildTable(client, "sq_q11_fuels", responseId, input.fuels ?? [], (row, i) => [
@@ -416,8 +467,9 @@ export async function saveQuestionnaire(input: QuestionnaireInput): Promise<Save
             await replaceChildTable(client, "sq_q13_qc_it_energy", responseId, input.qcItEnergy ?? [], (row, i) => [
                 row.item ?? null,
                 row.category ?? null, row.subCategory ?? null, row.materialGroup ?? null, row.specificType ?? null,
+                row.geography ?? null,
                 row.value ?? null, row.unit ?? null, row.alreadyInQ10 ?? false, i,
-            ], ["item", "category", "sub_category", "group_name", "specific_type", "value", "unit", "already_in_q10", "row_order"]);
+            ], ["item", "category", "sub_category", "group_name", "specific_type", "geography", "value", "unit", "already_in_q10", "row_order"]);
 
             await replaceChildTable(client, "sq_q14_production_waste", responseId, input.productionWaste ?? [], (row, i) => [
                 row.productIdOrMpn ?? null, row.componentName ?? null, row.wasteType ?? null, row.treatmentType ?? null,
@@ -632,9 +684,21 @@ export async function loadQuestionnaire(responseId: string): Promise<Questionnai
             electricity: (await loadChild("sq_q10_electricity")).map((r) => ({
                 electricityType: r.electricity_type, generatorType: r.generator_type,
                 category: r.category, subCategory: r.sub_category, materialGroup: r.group_name, specificType: r.specific_type,
+                geography: r.geography,
                 quantity: numOrUndef(r.quantity), unit: r.unit,
                 renewablePct: numOrUndef(r.renewable_pct), renewableSourcing: r.renewable_sourcing,
                 infrastructureEmissionsIncluded: r.infrastructure_emissions_included,
+            })),
+            factoryProductWeights: (await loadChild("sq_q10a_factory_weights")).map((r) => ({
+                mpn: r.mpn, totalWeightKg: numOrUndef(r.total_weight_kg),
+            })),
+            factoryProductUnits: (await loadChild("sq_q10b_factory_units")).map((r) => ({
+                mpn: r.mpn, unitsProduced: numOrUndef(r.units_produced),
+            })),
+            processConsumables: (await loadChild("sq_q8b_process_consumables")).map((r) => ({
+                mpn: r.mpn, consumableMaterial: r.consumable_material,
+                category: r.category, subCategory: r.sub_category, materialGroup: r.group_name, specificType: r.specific_type,
+                totalQuantity: numOrUndef(r.total_quantity), unit: r.unit,
             })),
             fuels: (await loadChild("sq_q11_fuels")).map((r) => ({
                 fuelCarrier: r.fuel_carrier,
@@ -649,6 +713,7 @@ export async function loadQuestionnaire(responseId: string): Promise<Questionnai
             qcItEnergy: (await loadChild("sq_q13_qc_it_energy")).map((r) => ({
                 item: r.item,
                 category: r.category, subCategory: r.sub_category, materialGroup: r.group_name, specificType: r.specific_type,
+                geography: r.geography,
                 value: numOrUndef(r.value), unit: r.unit, alreadyInQ10: r.already_in_q10,
             })),
             productionWaste: (await loadChild("sq_q14_production_waste")).map((r) => ({
@@ -844,10 +909,12 @@ export function validateForSubmit(input: QuestionnaireInput): ValidationError[] 
         });
     }
 
-    // Q5 mandatory
+    // Q5 mandatory — only the reference period is supplier-provided. The
+    // reference end is auto-derived in the form (start + 1 year − 1 day).
+    // Validity is no longer collected from the supplier; it is set at PCF
+    // report generation (generation date → +1 year), so it is not required here.
     if (!input.referencePeriodStart) errors.push({ field: "referencePeriodStart", message: "Q5 — reference period start is required" });
     if (!input.referencePeriodEnd) errors.push({ field: "referencePeriodEnd", message: "Q5 — reference period end is required" });
-    if (!input.validityPeriodStart) errors.push({ field: "validityPeriodStart", message: "Q5 — validity period start is required" });
 
     // Q6 + Q7 mandatory
     if (!input.retroOrProspectivePcfType) errors.push({ field: "retroOrProspectivePcfType", message: "Q6 — PCF type is required" });

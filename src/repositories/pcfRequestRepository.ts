@@ -152,6 +152,126 @@ export async function buildEnviraanPcfInputFromRequest(
     });
 }
 
+export interface PerComponentPcfInput {
+    bomId: string;
+    componentName: string;
+    materialNumber: string;
+    componentCategory: string;
+    supplierName: string;
+    input: EnviraanPcfInput;
+}
+
+/**
+ * Builds one EnviraanPcfInput per calculated BOM component of a request (rather
+ * than the single product-level aggregate). Each component's per-stage values
+ * come from its own bom_emission_calculation_engine row (product_id IS NULL).
+ * Used by the read-only per-component submodel preview — no side effects.
+ */
+export async function buildEnviraanPcfInputsPerComponentFromRequest(
+    bomPcfRequestId: string
+): Promise<PerComponentPcfInput[]> {
+    return withClient(async (client) => {
+        const reqResult = await client.query(
+            `SELECT r.id, r.code, r.created_date
+             FROM bom_pcf_request r
+             WHERE r.id = $1`,
+            [bomPcfRequestId]
+        );
+        if (reqResult.rows.length === 0) {
+            throw new Error(`bom_pcf_request not found: ${bomPcfRequestId}`);
+        }
+        const req = reqResult.rows[0];
+        const referenceYear = new Date(req.created_date).getFullYear();
+        const companyName =
+            process.env.QUINTARI_OWN_COMPANY_NAME ||
+            "Enviguide Techno Solutions Pvt Ltd";
+        const companyBpn = process.env.QUINTARI_OWN_BPN || "BPNL000000000001";
+
+        const compResult = await client.query(
+            `SELECT
+                b.id                 AS bom_id,
+                b.code               AS bom_code,
+                b.material_number,
+                b.component_name,
+                b.component_category,
+                b.detail_description,
+                b.weight_gms,
+                b.total_weight_gms,
+                sd.supplier_name,
+                bec.material_value,
+                bec.production_value,
+                bec.packaging_value,
+                bec.logistic_value,
+                bec.waste_value,
+                bec.total_pcf_value
+             FROM bom b
+             LEFT JOIN bom_emission_calculation_engine bec
+                 ON bec.bom_id = b.id AND bec.product_id IS NULL
+             LEFT JOIN supplier_details sd
+                 ON sd.sup_id = b.supplier_id
+             WHERE b.bom_pcf_id = $1 AND b.is_bom_calculated = TRUE
+             ORDER BY b.created_date ASC`,
+            [bomPcfRequestId]
+        );
+
+        return compResult.rows.map((row: any): PerComponentPcfInput => {
+            // weight_gms is the per-piece mass (total_weight_gms = qty × weight_gms).
+            // The submodel declares 1 piece and the per-component emission rows are
+            // per declared unit, so use the per-piece weight to stay consistent.
+            const massGms =
+                row.weight_gms != null
+                    ? Number(row.weight_gms)
+                    : row.total_weight_gms != null
+                      ? Number(row.total_weight_gms)
+                      : null;
+            const productCode =
+                row.material_number || row.bom_code || "COMPONENT";
+            const componentName =
+                row.component_name || `Component ${productCode}`;
+            const componentCategory = row.component_category || "";
+            const supplierName = row.supplier_name || "";
+
+            const input: EnviraanPcfInput = {
+                productCode,
+                productName: componentName,
+                productDescription: row.detail_description ?? componentName,
+                productMassKg: massGms != null ? massGms / 1000 : undefined,
+                productClassifications: componentCategory
+                    ? [componentCategory]
+                    : [],
+                companyName,
+                companyBpn,
+                totalPcfValue: Number(row.total_pcf_value) || 0,
+                materialValue: Number(row.material_value) || 0,
+                productionValue: Number(row.production_value) || 0,
+                packagingValue: Number(row.packaging_value) || 0,
+                logisticValue: Number(row.logistic_value) || 0,
+                wasteValue: Number(row.waste_value) || 0,
+                geographyCountry: "IN",
+                geographyCountrySubdivision: "IN-TG",
+                referencePeriodStart: `${referenceYear}-01-01T00:00:00Z`,
+                referencePeriodEnd: `${referenceYear}-12-31T23:59:59Z`,
+                pcfScope: "Cradle-to-gate",
+                primaryDataShare: 50,
+                technologicalDQR: 2,
+                geographicalDQR: 2,
+                temporalDQR: 2,
+                pcfVersion: 1,
+                comment: `Component ${componentName} of Enviraan PCF request ${req.code}`,
+            };
+
+            return {
+                bomId: row.bom_id,
+                componentName,
+                materialNumber: row.material_number || "",
+                componentCategory,
+                supplierName,
+                input,
+            };
+        });
+    });
+}
+
 function rowToPublication(row: any): QuintariPublication {
     return {
         id: row.id,

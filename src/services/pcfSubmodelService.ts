@@ -120,15 +120,31 @@ export async function buildSubmodelsPerComponent(
     return results;
 }
 
+export interface AggregatedComputedDetail {
+    /** Identity/methodology from the first component (for the aggregate submodel). */
+    base: EnviraanPcfInput;
+    totalPcfValue: number;
+    productionStageDetail: any;
+    packagingStageDetail: any;
+    distributionStageDetail: any;
+    carbonContentDetail: {
+        biogenicCarbonContent: number;
+        fossilCarbonContent: number;
+        recycledCarbonContent: number;
+        carbonContentTotal: number;
+        packagingBiogenicCarbonContent: number;
+    };
+}
+
 /**
- * Aggregate "product (all components)" submodel: identity/methodology taken from
- * the first component, with the life-cycle-stage emissions and carbon content
- * SUMMED across all components (the product's total footprint). Returns null
- * when there are no calculable components.
+ * Sum the life-cycle-stage emissions and carbon content across every calculable
+ * component of a request (read from pcf_computed_field via assembleEnviraanInput).
+ * Shared by the aggregate submodel builder AND the Quintari publish path so both
+ * send identical, real values. Returns null when no component has a saved response.
  */
-export async function buildAggregateSubmodel(
+export async function aggregateComputedDetail(
     bomPcfId: string
-): Promise<{ submodel: Record<string, unknown>; semanticId: string; specVersion: string } | null> {
+): Promise<AggregatedComputedDetail | null> {
     const pairs = await loadComponentResponses(bomPcfId);
     if (pairs.length === 0) return null;
 
@@ -189,13 +205,35 @@ export async function buildAggregateSubmodel(
         return s;
     };
 
-    const aggregateInput: EnviraanPcfInput = {
-        ...base,
+    return {
+        base,
         totalPcfValue: round6(totalPcf),
         productionStageDetail: roundStage(prod),
         packagingStageDetail: roundStage(pack),
         distributionStageDetail: roundStage(dist),
         carbonContentDetail: roundStage(carbon),
+    };
+}
+
+/**
+ * Aggregate "product (all components)" submodel: identity/methodology taken from
+ * the first component, with the life-cycle-stage emissions and carbon content
+ * SUMMED across all components (the product's total footprint). Returns null
+ * when there are no calculable components.
+ */
+export async function buildAggregateSubmodel(
+    bomPcfId: string
+): Promise<{ submodel: Record<string, unknown>; semanticId: string; specVersion: string } | null> {
+    const d = await aggregateComputedDetail(bomPcfId);
+    if (!d) return null;
+
+    const aggregateInput: EnviraanPcfInput = {
+        ...d.base,
+        totalPcfValue: d.totalPcfValue,
+        productionStageDetail: d.productionStageDetail,
+        packagingStageDetail: d.packagingStageDetail,
+        distributionStageDetail: d.distributionStageDetail,
+        carbonContentDetail: d.carbonContentDetail,
     };
 
     return {

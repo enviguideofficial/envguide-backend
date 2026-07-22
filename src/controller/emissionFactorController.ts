@@ -556,6 +556,7 @@ export async function getEfTaxonomy(req: any, res: any) {
             const category = String(req.query.category || "").trim();
             const subCategory = String(req.query.sub_category || "").trim();
             const group = String(req.query.group || "").trim();
+            const specificType = String(req.query.specific_type || "").trim();
 
             // Include EF=0 rows: a zero emission factor is valid real data (many
             // legitimate waste/recycling treatments are ~0). Only require the EF
@@ -571,12 +572,16 @@ export async function getEfTaxonomy(req: any, res: any) {
                 level === "category" ? "category" :
                 level === "sub_category" ? "sub_category" :
                 level === "group" ? "group_name" :
-                level === "specific_type" ? "specific_type" : "";
+                level === "specific_type" ? "specific_type" :
+                level === "geography" ? "geography" : "";
             if (!col) return res.status(400).send({ success: false, message: `invalid level: ${level}` });
 
+            // Cascade parents: each level is filtered by every level above it.
+            // geography is the 5th/last level (Electricity Q10) — filtered by all 4.
             if (level !== "category") addParentEq("category", category);
-            if (level === "group" || level === "specific_type") addParentEq("sub_category", subCategory);
-            if (level === "specific_type") addParentEq("group_name", group);
+            if (level === "group" || level === "specific_type" || level === "geography") addParentEq("sub_category", subCategory);
+            if (level === "specific_type" || level === "geography") addParentEq("group_name", group);
+            if (level === "geography") addParentEq("specific_type", specificType);
 
             if (q) { conds.push(`${col} ILIKE $${p++}`); params.push(`%${q}%`); }
             const where = `WHERE ${conds.join(" AND ")} AND ${col} IS NOT NULL AND ${col} <> ''`;

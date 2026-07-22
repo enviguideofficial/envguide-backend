@@ -78,6 +78,15 @@ export async function assembleEnviraanInput(responseId: string): Promise<Enviraa
         computed.packagingStage.pcfIncludingBiogenicUptake +
         computed.distributionStage.pcfIncludingBiogenicUptake;
 
+    // Validity window is stamped at report-generation time: it starts on the
+    // generation date and ends on the same date one year later. setUTCFullYear
+    // normalizes a Feb-29 start to Mar-1 the next year automatically.
+    const generatedAt = new Date();
+    const validityEndDate = new Date(generatedAt);
+    validityEndDate.setUTCFullYear(validityEndDate.getUTCFullYear() + 1);
+    const validityStart = generatedAt.toISOString();
+    const validityEnd = validityEndDate.toISOString();
+
     return {
         // --- Identity / product
         productCode: cleanProductId(ctx.main.product_id_urn),
@@ -108,10 +117,14 @@ export async function assembleEnviraanInput(responseId: string): Promise<Enviraa
         geographyRegionOrSubregion: region ?? undefined,
 
         // --- Time
+        // Reference period is supplier-provided (end auto-derived to complete one
+        // financial year). Validity is NOT collected from the supplier: it is set
+        // here at PCF report generation — validity runs from the generation date
+        // until the same date one year later.
         referencePeriodStart: isoDate(ctx.main.reference_period_start) ?? "2025-01-01T00:00:00Z",
         referencePeriodEnd: isoDate(ctx.main.reference_period_end) ?? "2025-12-31T23:59:59Z",
-        validityPeriodStart: isoDate(ctx.main.validity_period_start) ?? undefined,
-        validityPeriodEnd: isoDate(ctx.main.validity_period_end) ?? undefined,
+        validityPeriodStart: validityStart,
+        validityPeriodEnd: validityEnd,
 
         // --- Scope + methodology
         pcfScope: scope,

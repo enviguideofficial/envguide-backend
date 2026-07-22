@@ -50,6 +50,11 @@ export interface EfMatchInput {
     subCategory?: string | null;
     group?: string | null;
     specificType?: string | null;
+    // Exact geography pin (e.g. "DE - Germany") — the supplier's 5th cascade
+    // dropdown. When present it's added to the EXACT lookup so a country-specific
+    // EF (electricity Q10) resolves to one row. Uses the DB's exact geography
+    // string, NOT the ISO code used by the fuzzy `country`/`region` scoring.
+    geography?: string | null;
     // Optional free-text — kept for future Layer 2 (semantic) hook.
     description?: string | null;
     // Source attribution for the audit row.
@@ -132,20 +137,20 @@ export async function findBestEf(input: EfMatchInput): Promise<EfMatchResult> {
         }
 
         // 3. Layer 3 — score every surviving candidate.
-        //    Tie-break: for stocks/streams (material/packaging/waste) prefer the
-        //    HIGHEST factor — conservative and matches the manager's rule. For
-        //    energy/transport/fuels/gases a "highest EF" tie-break would pick the
-        //    dirtiest source (coal over grid mix, worst lorry), so keep them on a
-        //    stable newest-first order and let geography/exactness decide instead.
-        const preferHighestEf = ["material", "packaging", "waste"].includes(input.activityType);
+        //    Tie-break: when candidates score equally, pick the HIGHEST emission
+        //    factor — the conservative choice, per the manager's rule. This is the
+        //    designed fallback for the exact 5-column cascade (Category → Sub →
+        //    Group → Specific Type → Geography): once all 5 match, any remaining
+        //    rows are genuine DB duplicates (identical except gwp_100), so the
+        //    highest is the safe pick. Applies to every activity type — the exact
+        //    cascade already pins the source, so the old "don't pick the dirtiest
+        //    source for energy/transport" concern no longer applies.
         const scored = candidates
             .map((row) => scoreRow(row, input, cfg))
             .sort(
                 (a, b) =>
                     b.score - a.score ||
-                    (preferHighestEf
-                        ? parseFloat(b.row.kgco2e_per_unit ?? "0") - parseFloat(a.row.kgco2e_per_unit ?? "0")
-                        : 0)
+                    parseFloat(b.row.kgco2e_per_unit ?? "0") - parseFloat(a.row.kgco2e_per_unit ?? "0")
             );
 
         const winner = scored[0];
@@ -271,6 +276,9 @@ async function layer1Filter(client: any, input: EfMatchInput): Promise<Candidate
         eqNorm("category", input.category);
         eqNorm("sub_category", input.subCategory);
         eqNorm("group_name", input.group);
+        // 5th pin (electricity Q10): geography narrows a country-specific EF to
+        // one row. Only constrains when the supplier actually picked it.
+        eqNorm("geography", input.geography);
         const r = await client.query(
             `SELECT ${SELECT_COLS} FROM emission_factors
               WHERE ${conds.join(" AND ")}

@@ -59,7 +59,7 @@ export interface ComputedFields {
     // waste = Q14 + Q17, logistics = distribution stage. Sums to the grand total.
     breakdown: {
         materials: number;
-        production: number;
+        production: number; // includes Q8b process consumables (auxiliaries)
         packaging: number;
         waste: number;
         logistics: number;
@@ -87,7 +87,10 @@ interface SupplierData {
     q4_sites: any[];
     q8_bom: any[];
     q9a_coproducts: any[];
+    q8b_process_consumables: any[];
     q10_electricity: any[];
+    q10a_factory_weights: any[];
+    q10b_factory_units: any[];
     q11_fuels: any[];
     q12_process_gases: any[];
     q13_qc_it_energy: any[];
@@ -266,6 +269,15 @@ export async function computePcfFields(responseId: string): Promise<ComputedFiel
     // Verification & certification shares from Q27.
     const verificationShares = computeVerificationShares(data);
 
+    // Q8b process consumables (auxiliaries) — consumed during manufacturing, so
+    // they are folded INTO the production stage (per the team's confirmation).
+    // Added to the production stage's fossil + PCF totals so they flow through the
+    // production bucket and the grand total automatically.
+    const auxiliariesEmission = await computeAuxiliariesEmission(data, responseId);
+    productionStage.fossilGhgEmissions = round6(productionStage.fossilGhgEmissions + auxiliariesEmission);
+    productionStage.pcfExcludingBiogenicUptake = round6(productionStage.pcfExcludingBiogenicUptake + auxiliariesEmission);
+    productionStage.pcfIncludingBiogenicUptake = round6(productionStage.pcfIncludingBiogenicUptake + auxiliariesEmission);
+
     // Legacy 5-bucket breakdown (Materials / Production / Packaging / Waste /
     // Logistics) for the PCF Results view. Derived from the v9 stages so the five
     // values sum exactly to the grand total: materials & production-waste are
@@ -310,6 +322,7 @@ export async function computePcfFields(responseId: string): Promise<ComputedFiel
         packagingStage.pcfIncludingBiogenicUptake +
         distributionStage.pcfIncludingBiogenicUptake
     );
+    dbg(`  auxiliaries (Q8b) = ${round6(auxiliariesEmission)}  (folded into production above)`);
     dbg(`  ─────────────────────────────────────────────`);
     dbg(`  TOTAL PCF  excl biogenic uptake = ${grandExcl} kgCO2e`);
     dbg(`  TOTAL PCF  incl biogenic uptake = ${grandIncl} kgCO2e`);
@@ -360,7 +373,10 @@ async function loadSupplierData(responseId: string): Promise<SupplierData> {
             q4_sites: await loadChild("sq_q4_sites"),
             q8_bom: await loadChild("sq_q8_bom"),
             q9a_coproducts: await loadChild("sq_q9a_coproducts"),
+            q8b_process_consumables: await loadChild("sq_q8b_process_consumables"),
             q10_electricity: await loadChild("sq_q10_electricity"),
+            q10a_factory_weights: await loadChild("sq_q10a_factory_weights"),
+            q10b_factory_units: await loadChild("sq_q10b_factory_units"),
             q11_fuels: await loadChild("sq_q11_fuels"),
             q12_process_gases: await loadChild("sq_q12_process_gases"),
             q13_qc_it_energy: await loadChild("sq_q13_qc_it_energy"),
@@ -414,6 +430,50 @@ function computeAllocationFactor(data: SupplierData): number {
 // ============================================================
 // Carbon Content (5 fields)
 // ============================================================
+
+// ============================================================
+// Q8b Process Consumables (Auxiliaries) — team's Excel methodology.
+//   ① aux for all components = (component_total_weight ÷ factory_weight) × quantity
+//   ② per component          = ① ÷ units   ==  (component_weight × quantity) ÷ factory_weight
+//      (units cancel — same as electricity)
+//   emission = ② × EF   (EF from the row's 4-level cascade; NO geography)
+// Summed across every Q8b row → folded INTO the production stage (consumed during
+// manufacturing), so it flows through the production bucket and the grand total.
+// ============================================================
+async function computeAuxiliariesEmission(data: SupplierData, responseId: string): Promise<number> {
+    const rows = data.q8b_process_consumables ?? [];
+    if (rows.length === 0) return 0;
+
+    const productMass = num(data.main.product_mass_per_declared_unit);
+    const q10aSum = data.q10a_factory_weights.reduce((s: number, r: any) => s + num(r.total_weight_kg), 0);
+    const factoryWeight = q10aSum > 0 ? q10aSum : num(data.main.factory_total_weight_kg);
+    if (productMass <= 0 || factoryWeight <= 0) {
+        dbg(`   [Q8b] skipped — need productMass(${productMass}) and ΣQ10a factory weight(${factoryWeight}) > 0`);
+        return 0;
+    }
+
+    let total = 0;
+    for (const row of rows) {
+        const quantity = num(row.total_quantity);
+        if (quantity <= 0) continue;
+        // per component = (component_weight × quantity) ÷ factory_weight  (units cancel)
+        const perComponent = (productMass * quantity) / factoryWeight;
+        const ef_ = await ef({
+            activityType: "material",
+            material: row.consumable_material || row.category,
+            category: row.category, subCategory: row.sub_category, group: row.group_name, specificType: row.specific_type,
+            unit: row.unit, unitKind: "mass",
+            sourceQuestion: "q8b_process_consumables",
+            sourceRowId: row.id,
+            responseId,
+        });
+        const contrib = perComponent * ef_;
+        total += contrib;
+        dbg(`   [Q8b] ${row.consumable_material || row.specific_type}: qty=${quantity}  perComp=(${productMass}×${quantity})/${factoryWeight}=${perComponent.toFixed(6)} × EF ${ef_} = ${contrib.toFixed(6)}`);
+    }
+    dbg(`   [Q8b] auxiliaries TOTAL = ${round6(total)} kgCO2e (folded into the production stage)`);
+    return round6(total);
+}
 
 function computeCarbonContent(data: SupplierData): ComputedFields["carbonContent"] {
     const productMass = num(data.main.product_mass_per_declared_unit);
@@ -526,43 +586,49 @@ async function computeProductionStage(
         dbg(`   [Q8] ${row.material}: ${num(row.mass_pct)}% × ${productMass}kg = ${componentMass}kg × ${ef_} = ${contrib.toFixed(6)} kgCO2e (fossil=${fossil.toFixed(6)})`);
     }
 
-    // --- Q10 electricity.
-    // Manager's model — mass-based factory allocation. The per-unit share of
-    // factory electricity is just the product's mass divided by the total mass
-    // the factory produced, times the factory's total energy:
-    //   perUnitKwh = product_mass × factory_energy / factory_weight
-    //   emission   = perUnitKwh × electricity EF × (1 − renewable share)
-    // (This is the algebraic reduction of the old
-    //  (component_total_weight / factory_weight) × factory_energy / num_products,
-    //  since component_total_weight / num_products = product_mass. So the supplier
-    //  only needs to give the two factory totals — both in kWh / kg.)
-    // Guards: product_mass and factory_weight must be > 0 (same kg unit on both
-    // sides); otherwise fall back to per-row entered quantity.
-    const factoryEnergy = num(data.main.factory_total_energy_kwh);
-    const factoryWeight = num(data.main.factory_total_weight_kg);
+    // --- Q10 electricity — team's Excel methodology (mass-based factory allocation).
+    // Inputs the supplier gives:
+    //   factory energy = Q10 "Quantity"  (whole-factory kWh for the period)
+    //   factory weight = Σ Q10a rows     (total weight of EVERY product the factory made)
+    //   units          = Q10b            (units of THIS component produced)
+    //   component wt   = product_mass_per_declared_unit (Q3)
+    // Then, per the Excel:
+    //   ① this component's total weight = component_wt × units
+    //   ② electricity for this component = (① ÷ Σ Q10a) × factory energy
+    //   ③ per unit = ② ÷ units   ==  component_wt × factory_energy ÷ Σ Q10a
+    // (units cancel in ③, so the per-unit value doesn't depend on Q10b — but we
+    //  compute ①②③ explicitly and log them so the calc mirrors the methodology doc.)
+    //   emission = ③ × electricity EF × (1 − renewable share)
+    // Legacy fallback: old responses saved before Q10a/Q10b existed used single
+    // main fields — honour them so old data never breaks.
+    const factoryEnergy = num(data.q10_electricity[0]?.quantity) || num(data.main.factory_total_energy_kwh);
+    const q10aSum = data.q10a_factory_weights.reduce((s: number, r: any) => s + num(r.total_weight_kg), 0);
+    const factoryWeight = q10aSum > 0 ? q10aSum : num(data.main.factory_total_weight_kg);
     // productMass (declared above) is the component's per-unit mass from Q3c.
     const useFactoryAllocation = factoryEnergy > 0 && factoryWeight > 0 && productMass > 0;
 
     // The SAME factory→component mass allocation applies to every factory-level
     // production input, not just electricity: fuel (Q11), process gas (Q12) and
     // QC/IT energy (Q13) are all reported as whole-factory totals too. allocFactor
-    // is this component's share of the factory:
+    // is this component's per-unit share of the factory:
     //   allocFactor = product_mass / factory_weight   (both kg)
     // so a factory-total quantity × allocFactor = this component's per-unit share.
-    // (For electricity, quantity×allocFactor == productMass×factoryEnergy/factoryWeight,
-    //  which is why Q10 below writes the same math out longhand.)
     // Falls back to 1 (use the raw entered quantity) when the factory totals are
     // missing — same guard as electricity, so old data never breaks.
     const allocFactor = useFactoryAllocation ? productMass / factoryWeight : 1;
 
     if (useFactoryAllocation && data.q10_electricity.length > 0) {
-        const perUnitKwh = (productMass * factoryEnergy) / factoryWeight;
         const elecRow = data.q10_electricity[0]; // primary electricity source → EF
+        const units = num(data.q10b_factory_units[0]?.units_produced); // Q10b (for the audit steps)
+        const componentTotalWeight = productMass * units;                        // ①
+        const componentElectricity = (componentTotalWeight / factoryWeight) * factoryEnergy; // ②
+        const perUnitKwh = (productMass * factoryEnergy) / factoryWeight;        // ③ (units cancel)
         const ef_ = await ef({
             activityType: "energy",
             material: elecRow.electricity_type,
             process: elecRow.generator_type,
             category: elecRow.category, subCategory: elecRow.sub_category, group: elecRow.group_name, specificType: elecRow.specific_type,
+            geography: elecRow.geography, // 5th cascade pin (Q10) → exact country EF
             country, region,
             unit: elecRow.unit, unitKind: "energy",
             year,
@@ -573,7 +639,9 @@ async function computeProductionStage(
         const renewableShare = (num(elecRow.renewable_pct) / 100) || 0;
         const contrib = perUnitKwh * ef_ * (1 - renewableShare);
         fossil += contrib;
-        dbg(`   [Q10-alloc] perUnit=${productMass}×${factoryEnergy}/${factoryWeight}=${perUnitKwh.toFixed(6)}kWh × ${ef_} × (1−${renewableShare}) = ${contrib.toFixed(6)}`);
+        dbg(`   [Q10] factoryEnergy(Q10)=${factoryEnergy}kWh  ΣQ10a=${factoryWeight}kg  units(Q10b)=${units}  compWt=${productMass}kg`);
+        dbg(`   [Q10-steps] ①compTotWt=${productMass}×${units}=${componentTotalWeight.toFixed(4)}kg  ②elec=(${componentTotalWeight.toFixed(4)}/${factoryWeight})×${factoryEnergy}=${componentElectricity.toFixed(4)}kWh  ③perUnit=${perUnitKwh.toFixed(6)}kWh`);
+        dbg(`   [Q10-alloc] ${perUnitKwh.toFixed(6)}kWh × EF ${ef_} × (1−${renewableShare}) = ${contrib.toFixed(6)} kgCO2e`);
     } else {
         for (const row of data.q10_electricity) {
             const qty = num(row.quantity);
@@ -583,6 +651,7 @@ async function computeProductionStage(
                 material: row.electricity_type,
                 process: row.generator_type,
                 category: row.category, subCategory: row.sub_category, group: row.group_name, specificType: row.specific_type,
+                geography: row.geography, // 5th cascade pin (Q10) → exact country EF
                 country, region,
                 unit: row.unit, unitKind: "energy",
                 year,
@@ -645,6 +714,7 @@ async function computeProductionStage(
             activityType: "energy",
             material: row.item,
             category: row.category, subCategory: row.sub_category, group: row.group_name, specificType: row.specific_type,
+            geography: row.geography, // 5th cascade pin (Q13) → exact country EF, same as Q10
             country, region,
             unit: row.unit, unitKind: "energy",
             year,

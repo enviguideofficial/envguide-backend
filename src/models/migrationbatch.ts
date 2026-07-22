@@ -3927,7 +3927,8 @@ ADD COLUMN IF NOT EXISTS ef_code VARCHAR(255);
             ADD COLUMN IF NOT EXISTS category TEXT,
             ADD COLUMN IF NOT EXISTS sub_category TEXT,
             ADD COLUMN IF NOT EXISTS group_name TEXT,
-            ADD COLUMN IF NOT EXISTS specific_type TEXT;`,
+            ADD COLUMN IF NOT EXISTS specific_type TEXT,
+            ADD COLUMN IF NOT EXISTS geography TEXT;`,
         `ALTER TABLE sq_q11_fuels
             ADD COLUMN IF NOT EXISTS category TEXT,
             ADD COLUMN IF NOT EXISTS sub_category TEXT,
@@ -3937,7 +3938,8 @@ ADD COLUMN IF NOT EXISTS ef_code VARCHAR(255);
             ADD COLUMN IF NOT EXISTS category TEXT,
             ADD COLUMN IF NOT EXISTS sub_category TEXT,
             ADD COLUMN IF NOT EXISTS group_name TEXT,
-            ADD COLUMN IF NOT EXISTS specific_type TEXT;`,
+            ADD COLUMN IF NOT EXISTS specific_type TEXT,
+            ADD COLUMN IF NOT EXISTS geography TEXT;`,
         `ALTER TABLE sq_q14_production_waste
             ADD COLUMN IF NOT EXISTS category TEXT,
             ADD COLUMN IF NOT EXISTS sub_category TEXT,
@@ -4021,6 +4023,46 @@ ADD COLUMN IF NOT EXISTS ef_code VARCHAR(255);
             created_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         );`,
         `CREATE INDEX IF NOT EXISTS idx_sq_q10_response_id ON sq_q10_electricity (response_id);`,
+
+        // Q10a: per-product total weight produced at the factory (one row per MPN).
+        // Summed across rows → factory-total weight = the electricity allocation
+        // denominator. Q10b: units produced per product.
+        `CREATE TABLE IF NOT EXISTS sq_q10a_factory_weights (
+            id VARCHAR(255) PRIMARY KEY,
+            response_id VARCHAR(255) NOT NULL,
+            mpn TEXT,
+            total_weight_kg DOUBLE PRECISION,
+            row_order INTEGER DEFAULT 0,
+            created_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_sq_q10a_response_id ON sq_q10a_factory_weights (response_id);`,
+        `CREATE TABLE IF NOT EXISTS sq_q10b_factory_units (
+            id VARCHAR(255) PRIMARY KEY,
+            response_id VARCHAR(255) NOT NULL,
+            mpn TEXT,
+            units_produced DOUBLE PRECISION,
+            row_order INTEGER DEFAULT 0,
+            created_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_sq_q10b_response_id ON sq_q10b_factory_units (response_id);`,
+
+        // Q8b: process consumable materials (auxiliaries) used in production but
+        // NOT in the BOM. mass-allocated per component × EF, added to the total.
+        `CREATE TABLE IF NOT EXISTS sq_q8b_process_consumables (
+            id VARCHAR(255) PRIMARY KEY,
+            response_id VARCHAR(255) NOT NULL,
+            mpn TEXT,
+            consumable_material TEXT,
+            category TEXT,
+            sub_category TEXT,
+            group_name TEXT,
+            specific_type TEXT,
+            total_quantity DOUBLE PRECISION,
+            unit VARCHAR(100),
+            row_order INTEGER DEFAULT 0,
+            created_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_sq_q8b_response_id ON sq_q8b_process_consumables (response_id);`,
 
         // Q11: fuels / energy carriers
         `CREATE TABLE IF NOT EXISTS sq_q11_fuels (
