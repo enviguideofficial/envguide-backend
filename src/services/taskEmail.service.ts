@@ -25,7 +25,7 @@ export async function sendSupplierTaskEmail(payload: {
         { expiresIn: "60d" }
     );
     const link =
-        `https://enviguide.nextechltd.in/supplier-questionnaire` +
+        `${process.env.FRONTEND_URL || "https://enviraan.com"}/supplier-questionnaire` +
         `?bom_pcf_id=${payload.bom_pcf_id}` +
         `&sup_id=${payload.supplier_id}` +
         `&token=${encodeURIComponent(token)}`;

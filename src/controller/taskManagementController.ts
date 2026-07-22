@@ -804,7 +804,7 @@ export async function sampleEmailTest(req: any, res: any) {
         const bom_pcf_id = '123nbb';
         const supplier_id = '65lko';
 
-        const link = `https://enviguide.nextechltd.in/supplier-questionnaire?bom_pcf_id=${bom_pcf_id}&sup_id=${supplier_id}`;
+        const link = `${process.env.FRONTEND_URL || "https://enviraan.com"}/supplier-questionnaire?bom_pcf_id=${bom_pcf_id}&sup_id=${supplier_id}`;
 
         const html = `
 <!DOCTYPE html>
