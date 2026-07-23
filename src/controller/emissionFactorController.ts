@@ -1,11 +1,10 @@
 import { withClient } from "../util/database.js";
 
-// The unified BAFU 2025 emission_factors table is loaded from an 8-column CSV:
-// the 7 source columns from "Main DB.csv" plus an explicit leading `Domain`
-// column (the merged file has no domain, so the admin adds it before upload).
-// (The old "Dataset Name" column was removed — the source file no longer has
-// it; `specific_type` is now the sole EF name and dedup key.)
-// `ef_id` is BIGSERIAL (auto); `is_legacy`, `search_text`, `source_db` are
+// The unified BAFU 2025 emission_factors table is loaded from a clubbed CSV
+// with the 7 source columns (Category, Sub-category, Group, Specific Type,
+// Geography, Unit, GWP 100). Domain is optional — when omitted every row is
+// stamped with DEFAULT_DOMAIN so any row count can import. `ef_id` is
+// BIGSERIAL (auto); `is_legacy`, `search_text`, `source_db` are
 // derived/defaulted server-side. Header matching is tolerant (see mapHeaders):
 // case/spacing/punctuation are normalized, so "Sub-category", "Sub Category",
 // "GWP 100 [kg CO2e]" and the cp1252-mangled "GWP 100 [kg CO?e]" all resolve.
@@ -38,36 +37,17 @@ const DB_COLUMNS = [
     "search_text",
 ];
 
+// Used when the CSV has no Domain column (normal clubbed-file import).
+const DEFAULT_DOMAIN = "general";
+
 const ALLOWED_DOMAINS = new Set([
     "material",
     "manufacturing",
     "packaging",
     "transport",
     "waste",
+    "general",
 ]);
-
-// Auto-domain (row-position) mode: the merged "Main DB.csv" has NO domain
-// column — it is 5 sections stacked in this fixed order. When the upload has no
-// Domain column we assign domain by row position, exactly like the seed did.
-// Only valid for the canonical file whose section sizes sum to EXPECTED_TOTAL.
-const SECTIONS: Array<{ domain: string; count: number }> = [
-    { domain: "material", count: 2556 },
-    { domain: "manufacturing", count: 5411 },
-    { domain: "packaging", count: 43 },
-    { domain: "transport", count: 1478 },
-    { domain: "waste", count: 817 },
-];
-const EXPECTED_TOTAL = SECTIONS.reduce((s, x) => s + x.count, 0); // 10,305
-
-// Domain for the Nth non-blank data row (0-based) under row-position mode.
-function domainByPosition(index: number): string | null {
-    let c = 0;
-    for (const s of SECTIONS) {
-        if (index < c + s.count) return s.domain;
-        c += s.count;
-    }
-    return null;
-}
 
 // Normalize a header cell for tolerant matching: lowercase, strip everything
 // that isn't a-z/0-9. "Sub-category" -> "subcategory", "GWP 100 [kg CO2e]" ->
@@ -95,8 +75,8 @@ const HEADER_TO_FIELD: Record<string, FieldKey> = {
 };
 
 // Resolve each CSV header to a field, returning the field->columnIndex map.
-// `Domain` is OPTIONAL — when absent, domain is assigned by row position. All
-// other 8 fields are required; missing ones are reported back to the caller.
+// `Domain` is OPTIONAL — when absent, every row gets DEFAULT_DOMAIN. The other
+// 7 fields are required; missing ones are reported back to the caller.
 function mapHeaders(header: string[]): {
     map: Partial<Record<FieldKey, number>> | null;
     missing: FieldKey[];
@@ -238,15 +218,13 @@ function validateRow(
         return idx === undefined ? "" : (cells[idx] ?? "").trim();
     };
 
-    // Domain comes from the column when present, else from row position.
-    const domain = (domainOverride ?? get("domain")).toLowerCase();
-    if (!domain) {
-        errors.push({ row: rowIndex, field: "Domain", message: "required (no Domain column and row is outside the known sections)" });
-    } else if (!ALLOWED_DOMAINS.has(domain)) {
+    // Domain from column when present, else DEFAULT_DOMAIN (clubbed file, any size).
+    const domain = (domainOverride ?? (get("domain") || DEFAULT_DOMAIN)).toLowerCase();
+    if (!ALLOWED_DOMAINS.has(domain)) {
         errors.push({
             row: rowIndex,
             field: "Domain",
-            message: `invalid "${domain}" (expected material/manufacturing/packaging/transport/waste)`,
+            message: `invalid "${domain}" (expected material/manufacturing/packaging/transport/waste/general)`,
         });
     }
 
@@ -318,34 +296,15 @@ export async function importEmissionFactorsCsv(req: any, res: any) {
         }
 
         const dataRows = rows.slice(1);
-        // Non-blank data rows drive row-position domain assignment.
-        const nonBlankCount = dataRows.filter(
-            (r) => !r.every((c) => (c ?? "").trim() === "")
-        ).length;
-
-        // Auto-domain (no Domain column) only works for the canonical layout,
-        // whose 5 sections sum to EXPECTED_TOTAL rows. Bail early with a clear
-        // message rather than silently mis-stamping domains.
-        if (!hasDomain && nonBlankCount !== EXPECTED_TOTAL) {
-            return res.status(400).send({
-                success: false,
-                message:
-                    `No "Domain" column found, so domain is assigned by row position — ` +
-                    `but that needs exactly ${EXPECTED_TOTAL} rows in the standard order ` +
-                    `(material, manufacturing, packaging, transport, waste). This file has ${nonBlankCount}. ` +
-                    `Either upload the standard Main DB file, or add a "Domain" column.`,
-            });
-        }
 
         const allErrors: ValidationError[] = [];
         const allValues: any[][] = [];
-        let pos = 0; // index among non-blank rows (for row-position domain)
         for (let i = 0; i < dataRows.length; i++) {
             const rowNum = i + 2; // CSV row number (1-based, header is row 1)
             // Skip fully-blank lines (trailing newline at end of file etc.).
             if (dataRows[i].every((c) => (c ?? "").trim() === "")) continue;
-            const domainOverride = hasDomain ? undefined : domainByPosition(pos);
-            pos++;
+            // No Domain column → stamp DEFAULT_DOMAIN so any row count imports.
+            const domainOverride = hasDomain ? undefined : DEFAULT_DOMAIN;
             const result = validateRow(dataRows[i], rowNum, map, domainOverride);
             if (result.errors.length > 0) {
                 allErrors.push(...result.errors);
@@ -411,9 +370,10 @@ export async function importEmissionFactorsCsv(req: any, res: any) {
         return res.status(200).send({
             success: true,
             message:
-                `Imported ${insertedCount} emission factors` +
+                `Imported ${insertedCount.toLocaleString()} emission factor row(s)` +
                 (skipped > 0 ? ` (${skipped} duplicate row(s) skipped)` : ""),
             insertedCount,
+            totalRows: insertedCount,
         });
     } catch (err: any) {
         console.error("importEmissionFactorsCsv error:", err);
