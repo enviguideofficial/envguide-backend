@@ -3939,7 +3939,9 @@ ADD COLUMN IF NOT EXISTS ef_code VARCHAR(255);
             ADD COLUMN IF NOT EXISTS sub_category TEXT,
             ADD COLUMN IF NOT EXISTS group_name TEXT,
             ADD COLUMN IF NOT EXISTS specific_type TEXT,
-            ADD COLUMN IF NOT EXISTS geography TEXT;`,
+            ADD COLUMN IF NOT EXISTS geography TEXT,
+            ADD COLUMN IF NOT EXISTS mpn TEXT,
+            ADD COLUMN IF NOT EXISTS equipment_type TEXT;`,
         `ALTER TABLE sq_q14_production_waste
             ADD COLUMN IF NOT EXISTS category TEXT,
             ADD COLUMN IF NOT EXISTS sub_category TEXT,
@@ -4064,6 +4066,27 @@ ADD COLUMN IF NOT EXISTS ef_code VARCHAR(255);
         );`,
         `CREATE INDEX IF NOT EXISTS idx_sq_q8b_response_id ON sq_q8b_process_consumables (response_id);`,
 
+        // Q8c: inbound raw-material transport legs to the manufacturing site.
+        // Emission per unit = (weight_tonnes ÷ Q10b_units) × distance_km × EF(tkm),
+        // with EF from 4-level taxonomy + Q4 Country→Region→Global fallback.
+        `CREATE TABLE IF NOT EXISTS sq_q8c_raw_material_transport (
+            id VARCHAR(255) PRIMARY KEY,
+            response_id VARCHAR(255) NOT NULL,
+            mpn TEXT,
+            category TEXT,
+            sub_category TEXT,
+            group_name TEXT,
+            specific_type TEXT,
+            source TEXT,
+            destination TEXT,
+            weight DOUBLE PRECISION,
+            unit VARCHAR(100),
+            distance_km DOUBLE PRECISION,
+            row_order INTEGER DEFAULT 0,
+            created_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_sq_q8c_response_id ON sq_q8c_raw_material_transport (response_id);`,
+
         // Q11: fuels / energy carriers
         `CREATE TABLE IF NOT EXISTS sq_q11_fuels (
             id VARCHAR(255) PRIMARY KEY,
@@ -4120,6 +4143,27 @@ ADD COLUMN IF NOT EXISTS ef_code VARCHAR(255);
         );`,
         `CREATE INDEX IF NOT EXISTS idx_sq_q14_response_id ON sq_q14_production_waste (response_id);`,
 
+        // Q14a: production-waste transport to treatment.
+        // Emission per leg = weight_tonnes × distance_km × EF(tkm)
+        // (kg→tonnes via /1000). EF from 4-level taxonomy + Q4 Country→Region→Global.
+        `CREATE TABLE IF NOT EXISTS sq_q14a_production_waste_transport (
+            id VARCHAR(255) PRIMARY KEY,
+            response_id VARCHAR(255) NOT NULL,
+            mpn TEXT,
+            category TEXT,
+            sub_category TEXT,
+            group_name TEXT,
+            specific_type TEXT,
+            source TEXT,
+            destination TEXT,
+            weight DOUBLE PRECISION,
+            unit VARCHAR(100),
+            distance_km DOUBLE PRECISION,
+            row_order INTEGER DEFAULT 0,
+            created_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_sq_q14a_response_id ON sq_q14a_production_waste_transport (response_id);`,
+
         // Q16: packaging materials
         `CREATE TABLE IF NOT EXISTS sq_q16_packaging_materials (
             id VARCHAR(255) PRIMARY KEY,
@@ -4169,6 +4213,27 @@ ADD COLUMN IF NOT EXISTS ef_code VARCHAR(255);
             created_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         );`,
         `CREATE INDEX IF NOT EXISTS idx_sq_q17_response_id ON sq_q17_packaging_waste (response_id);`,
+
+        // Q17a: packaging-waste transport to treatment.
+        // Emission per leg = weight_tonnes × distance_km × EF(tkm) (kg→tonnes).
+        // EF from 4-level taxonomy + Q4 Country→Region→Global fallback.
+        `CREATE TABLE IF NOT EXISTS sq_q17a_packaging_waste_transport (
+            id VARCHAR(255) PRIMARY KEY,
+            response_id VARCHAR(255) NOT NULL,
+            mpn TEXT,
+            category TEXT,
+            sub_category TEXT,
+            group_name TEXT,
+            specific_type TEXT,
+            source TEXT,
+            destination TEXT,
+            weight DOUBLE PRECISION,
+            unit VARCHAR(100),
+            distance_km DOUBLE PRECISION,
+            row_order INTEGER DEFAULT 0,
+            created_date TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );`,
+        `CREATE INDEX IF NOT EXISTS idx_sq_q17a_response_id ON sq_q17a_packaging_waste_transport (response_id);`,
 
         // Q19: distribution transport legs
         `CREATE TABLE IF NOT EXISTS sq_q19_transport_legs (

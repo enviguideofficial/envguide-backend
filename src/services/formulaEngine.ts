@@ -18,7 +18,9 @@
 //
 // Skip rules (per team confirmation):
 //   - Q15 packagingEmissionsIncluded = false → all packagingStage fields = 0
-//   - Q18 distributionStageIncluded   = false → all distributionStage fields = 0
+//   - Logistics (distribution stage) always = Q8c + Q14a + Q17a + Q19
+//     (Excel B65+B170+B212+B237). Q18 only seeds the included flag; if any of
+//     those legs produce a value we still mark distributionStageIncluded.
 //   - Q20 not filled                  → LUC, land management, biogenic uptake portions = 0
 //   - Q13 row with already_in_q10 = true → skipped in fossil GHG sum
 
@@ -56,7 +58,7 @@ export interface ComputedFields {
     // (Materials / Production / Packaging / Waste / Logistics). Derived from the
     // v9 stages: materials = Q8, production = production-stage minus materials &
     // production-waste, packaging = packaging-stage minus packaging-waste,
-    // waste = Q14 + Q17, logistics = distribution stage. Sums to the grand total.
+    // waste = Q14 + Q17, logistics = Q8c + Q14a + Q17a + Q19. Sums to the grand total.
     breakdown: {
         materials: number;
         production: number; // includes Q8b process consumables (auxiliaries)
@@ -88,6 +90,7 @@ interface SupplierData {
     q8_bom: any[];
     q9a_coproducts: any[];
     q8b_process_consumables: any[];
+    q8c_raw_material_transport: any[];
     q10_electricity: any[];
     q10a_factory_weights: any[];
     q10b_factory_units: any[];
@@ -95,9 +98,11 @@ interface SupplierData {
     q12_process_gases: any[];
     q13_qc_it_energy: any[];
     q14_production_waste: any[];
+    q14a_production_waste_transport: any[];
     q16_packaging_materials: any[];
     q16a_packaging_transport: any[];
     q17_packaging_waste: any[];
+    q17a_packaging_waste_transport: any[];
     q19_transport_legs: any[];
     q20_biomass_feedstock: any[];
     // GWP characterization factors (100-yr) read from the `gwp_factors` DB table,
@@ -166,9 +171,28 @@ function isBiogenicOrigin(v?: string | null): boolean {
 // multiplying by distance × EF — otherwise a kg weight is 1000× too large.
 function weightToTonnes(weight: number, unit?: string | null): number {
     const u = (unit ?? "kg").toLowerCase().trim();
-    if (u === "t" || u === "ton" || u === "tonne" || u === "tonnes" || u === "mt") return weight;
+    if (u === "t" || u === "ton" || u === "tons" || u === "tonne" || u === "tonnes" || u === "mt") return weight;
     if (u === "g" || u === "gram" || u === "grams") return weight / 1e6;
+    if (u === "lb" || u === "lbs" || u === "pound" || u === "pounds") return weight / 2204.6226;
     return weight / 1000; // default: kg → tonnes
+}
+
+/** Q10b units for an MPN (falls back to first Q10b row). */
+function q10bUnitsForMpn(data: SupplierData, mpn?: string | null): number {
+    const rows = data.q10b_factory_units ?? [];
+    if (rows.length === 0) return 0;
+    const key = String(mpn ?? "").trim();
+    if (key) {
+        const keyRoot = key.split(/\s*[—–-]/)[0].trim();
+        const hit = rows.find((r) => {
+            const m = String(r.mpn ?? "").trim();
+            if (!m) return false;
+            const mRoot = m.split(/\s*[—–-]/)[0].trim();
+            return m === key || mRoot === keyRoot || m.startsWith(keyRoot) || key.startsWith(mRoot);
+        });
+        if (hit) return num(hit.units_produced);
+    }
+    return num(rows[0]?.units_produced);
 }
 
 const ZERO_STAGE: StageEmissions = {
@@ -211,15 +235,21 @@ function dbgInputs(data: SupplierData): void {
     dbg(`      ${fmtRow(data.main)}`);
     section("Q4  sites", data.q4_sites);
     section("Q8  bill of materials", data.q8_bom);
+    section("Q8b process consumables", data.q8b_process_consumables);
+    section("Q8c raw-material transport", data.q8c_raw_material_transport);
     section("Q9a co-products", data.q9a_coproducts);
     section("Q10 electricity", data.q10_electricity);
+    section("Q10a factory weights", data.q10a_factory_weights);
+    section("Q10b factory units", data.q10b_factory_units);
     section("Q11 fuels", data.q11_fuels);
     section("Q12 process gases", data.q12_process_gases);
     section("Q13 QC/IT energy", data.q13_qc_it_energy);
     section("Q14 production waste", data.q14_production_waste);
+    section("Q14a waste transport", data.q14a_production_waste_transport);
     section("Q16 packaging materials", data.q16_packaging_materials);
     section("Q16a packaging transport", data.q16a_packaging_transport);
     section("Q17 packaging waste", data.q17_packaging_waste);
+    section("Q17a packaging waste transport", data.q17a_packaging_waste_transport);
     section("Q19 transport legs", data.q19_transport_legs);
     section("Q20 biomass feedstock", data.q20_biomass_feedstock);
 }
@@ -257,14 +287,16 @@ export async function computePcfFields(responseId: string): Promise<ComputedFiel
           }
         : { packagingEmissionsIncluded: false, ...ZERO_STAGE };
 
-    // Distribution stage — gated by Q18.
+    // Logistics / distribution stage = Q8c + Q14a + Q17a + Q19 (Excel: B65+B170+B212+B237).
+    // Always computed so these transport legs land in the logistics bucket / distribution
+    // datapoints (not production or packaging).
     const distributionIncluded = !!data.main.distribution_stage_included;
-    const distributionStage: StageEmissions & { distributionStageIncluded: boolean } = distributionIncluded
-        ? {
-              distributionStageIncluded: true,
-              ...(await computeDistributionStage(data, responseId)),
-          }
-        : { distributionStageIncluded: false, ...ZERO_STAGE };
+    const distComputed = await computeDistributionStage(data, responseId);
+    const distributionStage: StageEmissions & { distributionStageIncluded: boolean } = {
+        distributionStageIncluded:
+            distributionIncluded || distComputed.pcfIncludingBiogenicUptake > 0,
+        ...distComputed,
+    };
 
     // Verification & certification shares from Q27.
     const verificationShares = computeVerificationShares(data);
@@ -374,6 +406,7 @@ async function loadSupplierData(responseId: string): Promise<SupplierData> {
             q8_bom: await loadChild("sq_q8_bom"),
             q9a_coproducts: await loadChild("sq_q9a_coproducts"),
             q8b_process_consumables: await loadChild("sq_q8b_process_consumables"),
+            q8c_raw_material_transport: await loadChild("sq_q8c_raw_material_transport"),
             q10_electricity: await loadChild("sq_q10_electricity"),
             q10a_factory_weights: await loadChild("sq_q10a_factory_weights"),
             q10b_factory_units: await loadChild("sq_q10b_factory_units"),
@@ -381,9 +414,11 @@ async function loadSupplierData(responseId: string): Promise<SupplierData> {
             q12_process_gases: await loadChild("sq_q12_process_gases"),
             q13_qc_it_energy: await loadChild("sq_q13_qc_it_energy"),
             q14_production_waste: await loadChild("sq_q14_production_waste"),
+            q14a_production_waste_transport: await loadChild("sq_q14a_production_waste_transport"),
             q16_packaging_materials: await loadChild("sq_q16_packaging_materials"),
             q16a_packaging_transport: await loadChild("sq_q16a_packaging_transport"),
             q17_packaging_waste: await loadChild("sq_q17_packaging_waste"),
+            q17a_packaging_waste_transport: await loadChild("sq_q17a_packaging_waste_transport"),
             q19_transport_legs: await loadChild("sq_q19_transport_legs"),
             q20_biomass_feedstock: await loadChild("sq_q20_biomass_feedstock"),
         };
@@ -712,7 +747,8 @@ async function computeProductionStage(
         if (qty <= 0) continue;
         const ef_ = await ef({
             activityType: "energy",
-            material: row.item,
+            // Prefer equipment label; fall back to legacy `item` / MPN.
+            material: row.equipment_type || row.item || row.mpn,
             category: row.category, subCategory: row.sub_category, group: row.group_name, specificType: row.specific_type,
             geography: row.geography, // 5th cascade pin (Q13) → exact country EF, same as Q10
             country, region,
@@ -724,7 +760,7 @@ async function computeProductionStage(
         });
         const contrib = qty * allocFactor * ef_;
         fossil += contrib;
-        dbg(`   [Q13] ${row.item}: ${qty}${row.unit ?? ""} × ${allocFactor.toFixed(8)} (alloc) × ${ef_} = ${contrib.toFixed(6)}`);
+        dbg(`   [Q13] ${row.equipment_type || row.item || row.mpn}: ${qty}${row.unit ?? ""} × ${allocFactor.toFixed(8)} (alloc) × ${ef_} = ${contrib.toFixed(6)}`);
     }
 
     // --- Q14 production / QC waste
@@ -751,11 +787,8 @@ async function computeProductionStage(
             `${qty}${row.unit ?? ""} × ${ef_} = ${contrib.toFixed(6)}`);
     }
 
-    // --- Production-stage aircraft = INBOUND raw-material air freight only.
-    //   Q19 (outbound PRODUCT transport) air legs belong to the DISTRIBUTION stage
-    //   (distributionStageAircraftGhgEmissions) — that's the Catena-X stage where that
-    //   transport actually happens. Inbound raw-material air freight isn't captured as a
-    //   separate input yet, so production aircraft = 0.
+    // Q8c / Q14a transport legs live in the logistics (distribution) stage — see
+    // computeDistributionStage. Production-stage aircraft stays 0 here.
     let aircraft = 0;
 
     // --- Q20 land fields — all three follow the SAME shape (per Vishnu, 2026-07-10):
@@ -1005,6 +1038,9 @@ async function computePackagingStage(
             `${qty}${row.unit ?? ""} × ${ef_} = ${contrib.toFixed(6)}`);
     }
 
+    // Q17a packaging-waste transport → logistics (distribution) stage — see
+    // computeDistributionStage. Not counted in packaging.
+
     // Positive magnitude (matches the production-stage convention we set 2026-07-10).
     const biogenicCO2Uptake = packagingBiogenicCarbon * CO2_PER_C;
 
@@ -1048,11 +1084,137 @@ async function computeDistributionStage(
     // reference_period_start comes back from pg as a Date, whose .toString() is
     // "Wed Jan 01 2025 …" — slicing that gave "Wed " → NaN. Parse it as a real date.
     const year = new Date(data.main.reference_period_start ?? "").getFullYear() || 2025;
+    const primarySite = data.q4_sites.find((s) => s.is_primary) ?? data.q4_sites[0] ?? null;
+    const country = primarySite?.country ?? null;
+    const region = primarySite?.region ?? null;
 
-    dbg(`\n━━━ DISTRIBUTION STAGE ━━━`);
+    // Excel Logistics = B65(Q8c) + B170(Q19) + B212(Q14a) + B237(Q17a).
+    dbg(`\n━━━ DISTRIBUTION / LOGISTICS STAGE ━━━`);
+    dbg(`   (Q8c + Q14a + Q17a + Q19)`);
     let fossil = 0;
-    let aircraft = 0; // distributionStageAircraftGhgEmissions — Q19 air legs (mode-specific)
+    let aircraft = 0; // distributionStageAircraftGhgEmissions — any air legs
 
+    // --- Q8c inbound raw-material transport (Excel B65).
+    // deployed_t_per_unit = weight_tonnes ÷ Q10b_units; leg = deployed × distance × EF.
+    let q8cTotal = 0;
+    for (const row of data.q8c_raw_material_transport ?? []) {
+        const dist = num(row.distance_km);
+        const wt = num(row.weight);
+        if (dist <= 0 || wt <= 0) continue;
+        const units = q10bUnitsForMpn(data, row.mpn);
+        if (units <= 0) {
+            dbg(`   [Q8c] skip leg mpn=${row.mpn ?? "?"} — Q10b units missing/0`);
+            continue;
+        }
+        const tonnesTotal = weightToTonnes(wt, row.unit);
+        const deployedPerUnit = tonnesTotal / units;
+        const ef_ = await ef({
+            activityType: "transport",
+            material: row.specific_type || row.sub_category || row.category,
+            process: row.sub_category,
+            category: row.category,
+            subCategory: row.sub_category,
+            group: row.group_name,
+            specificType: row.specific_type,
+            country, region,
+            unit: "tkm",
+            unitKind: "freight",
+            year,
+            sourceQuestion: "q8c_raw_material_transport",
+            sourceRowId: row.id,
+            responseId,
+        });
+        const contribution = deployedPerUnit * dist * ef_;
+        q8cTotal += contribution;
+        if (transportModeIsAircraft(row)) aircraft += contribution;
+        else fossil += contribution;
+        dbg(
+            `   [Q8c] ${row.specific_type ?? row.sub_category ?? "leg"}: ` +
+            `wt=${tonnesTotal}t / units(Q10b)=${units} → deployed=${deployedPerUnit.toFixed(6)}t  ` +
+            `× ${dist}km × EF ${ef_} = ${contribution.toFixed(6)} ` +
+            `(${transportModeIsAircraft(row) ? "aircraft" : "fossil"})`
+        );
+    }
+    if (q8cTotal > 0) {
+        dbg(`   [Q8c] inbound transport TOTAL = ${round6(q8cTotal)} kgCO2e/unit`);
+    }
+
+    // --- Q14a production-waste transport (Excel B212). tonnes × distance × EF.
+    let q14aTotal = 0;
+    for (const row of data.q14a_production_waste_transport ?? []) {
+        const dist = num(row.distance_km);
+        const wt = num(row.weight);
+        if (dist <= 0 || wt <= 0) continue;
+        const tonnes = weightToTonnes(wt, row.unit);
+        const ef_ = await ef({
+            activityType: "transport",
+            material: row.specific_type || row.sub_category || row.category,
+            process: row.sub_category,
+            category: row.category,
+            subCategory: row.sub_category,
+            group: row.group_name,
+            specificType: row.specific_type,
+            country, region,
+            unit: "tkm",
+            unitKind: "freight",
+            year,
+            sourceQuestion: "q14a_production_waste_transport",
+            sourceRowId: row.id,
+            responseId,
+        });
+        const contribution = tonnes * dist * ef_;
+        q14aTotal += contribution;
+        if (transportModeIsAircraft(row)) aircraft += contribution;
+        else fossil += contribution;
+        dbg(
+            `   [Q14a] ${row.specific_type ?? row.sub_category ?? "leg"}: ` +
+            `${tonnes}t × ${dist}km × EF ${ef_} = ${contribution.toFixed(6)} ` +
+            `(${transportModeIsAircraft(row) ? "aircraft" : "fossil"})`
+        );
+    }
+    if (q14aTotal > 0) {
+        dbg(`   [Q14a] waste transport TOTAL = ${round6(q14aTotal)} kgCO2e`);
+    }
+
+    // --- Q17a packaging-waste transport (Excel B237). Same formula as Q14a.
+    let q17aTotal = 0;
+    for (const row of data.q17a_packaging_waste_transport ?? []) {
+        const dist = num(row.distance_km);
+        const wt = num(row.weight);
+        if (dist <= 0 || wt <= 0) continue;
+        const tonnes = weightToTonnes(wt, row.unit);
+        const ef_ = await ef({
+            activityType: "transport",
+            material: row.specific_type || row.sub_category || row.category,
+            process: row.sub_category,
+            category: row.category,
+            subCategory: row.sub_category,
+            group: row.group_name,
+            specificType: row.specific_type,
+            country, region,
+            unit: "tkm",
+            unitKind: "freight",
+            year,
+            sourceQuestion: "q17a_packaging_waste_transport",
+            sourceRowId: row.id,
+            responseId,
+        });
+        const contribution = tonnes * dist * ef_;
+        q17aTotal += contribution;
+        if (transportModeIsAircraft(row)) aircraft += contribution;
+        else fossil += contribution;
+        dbg(
+            `   [Q17a] ${row.specific_type ?? row.sub_category ?? "leg"}: ` +
+            `${tonnes}t × ${dist}km × EF ${ef_} = ${contribution.toFixed(6)} ` +
+            `(${transportModeIsAircraft(row) ? "aircraft" : "fossil"})`
+        );
+    }
+    if (q17aTotal > 0) {
+        dbg(`   [Q17a] packaging waste transport TOTAL = ${round6(q17aTotal)} kgCO2e`);
+    }
+
+    // --- Q19 outbound distribution legs (Excel B170).
+    let q19Total = 0;
     for (const row of data.q19_transport_legs) {
         const dist = num(row.distance_km);
         const wt = num(row.weight);
@@ -1070,13 +1232,21 @@ async function computeDistributionStage(
         });
         const tonnes = weightToTonnes(wt, row.unit);
         const contribution = dist * tonnes * ef_;
-        if (transportModeIsAircraft(row)) aircraft += contribution; // → distributionStageAircraftGhgEmissions
+        q19Total += contribution;
+        if (transportModeIsAircraft(row)) aircraft += contribution;
         else fossil += contribution;
         dbg(`   [Q19-dist] ${row.transport_mode ?? row.sub_category}: ${dist}km × ${tonnes}t × ${ef_} = ${contribution.toFixed(6)} (${transportModeIsAircraft(row) ? "aircraft" : "fossil"})`);
     }
+    if (q19Total > 0) {
+        dbg(`   [Q19] distribution transport TOTAL = ${round6(q19Total)} kgCO2e`);
+    }
 
     const pcfExcl = fossil + aircraft;
-    dbg(`   ── distribution totals: fossil=${round6(fossil)} aircraft=${round6(aircraft)}  PCF=${round6(pcfExcl)}`);
+    dbg(
+        `   ── logistics TOTAL = Q8c(${round6(q8cTotal)}) + Q14a(${round6(q14aTotal)}) ` +
+        `+ Q17a(${round6(q17aTotal)}) + Q19(${round6(q19Total)}) ` +
+        `= ${round6(pcfExcl)}  (fossil=${round6(fossil)} aircraft=${round6(aircraft)})`
+    );
     return {
         fossilGhgEmissions: round6(fossil),
         biogenicNonCO2Emissions: 0,
