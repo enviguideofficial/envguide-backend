@@ -12,6 +12,7 @@
 
 import { ulid } from "ulid";
 import { withClient } from "../util/database.js";
+import { geographyFallbackRank, pickByGeographyFallback } from "./geographyFallback.js";
 
 // ============================================================
 // Types
@@ -37,8 +38,8 @@ export interface EfMatchInput {
     activityType: ActivityType;
     material?: string | null;
     process?: string | null;
-    country?: string | null;         // ISO-2 code (e.g. "IN", "CN", "DE")
-    region?: string | null;          // e.g. "Asia", "Europe"
+    country?: string | null;         // Q4 country name or ISO-2 (e.g. "Belgium", "BE")
+    region?: string | null;          // Q4 region (e.g. "Europe", "Asia")
     unit?: string | null;            // e.g. "kg", "kWh", "tkm"
     unitKind?: string | null;        // e.g. "mass", "energy", "freight"
     year?: number | null;
@@ -255,9 +256,13 @@ async function layer1Filter(client: any, input: EfMatchInput): Promise<Candidate
     const domain = domainForActivity(input.activityType);
 
     // EXACT taxonomy lookup — when the supplier picked the full cascade
-    // (Category → Sub-category → Group → Specific Type), those 4 identify one
-    // EF row. Match exactly and skip the fuzzy path entirely. Dash-normalized so
-    // hyphen/em-dash differences don't matter.
+    // (Category → Sub-category → Group → Specific Type), those 4 identify the
+    // EF family. Dash-normalized so hyphen/em-dash differences don't matter.
+    //
+    // Geography (5th key):
+    //   • Q10/Q13 pass an explicit `geography` pin → exact filter (one row).
+    //   • All other questions use Q4 Country → Region → Global fallback when
+    //     multiple geography rows share the same 4 taxonomy levels.
     if (input.specificType && input.specificType.trim()) {
         // Honor a 0 here: when the supplier picks the full 4-level cascade they
         // identify ONE exact EF row, and some are legitimately 0 (e.g. waste-
@@ -276,8 +281,7 @@ async function layer1Filter(client: any, input: EfMatchInput): Promise<Candidate
         eqNorm("category", input.category);
         eqNorm("sub_category", input.subCategory);
         eqNorm("group_name", input.group);
-        // 5th pin (electricity Q10): geography narrows a country-specific EF to
-        // one row. Only constrains when the supplier actually picked it.
+        // Explicit geography pin (Q10/Q13 electricity sourcing) — exact string.
         eqNorm("geography", input.geography);
         const r = await client.query(
             `SELECT ${SELECT_COLS} FROM emission_factors
@@ -285,7 +289,15 @@ async function layer1Filter(client: any, input: EfMatchInput): Promise<Candidate
               ORDER BY gwp_100 DESC LIMIT ${MAX_CANDIDATES}`,
             params
         );
-        if (r.rows.length > 0) return r.rows;
+        if (r.rows.length > 0) {
+            // No explicit pin → apply Country → Region → Global fallback using
+            // Q4 (or per-row) country/region so "Belgium missing" picks RER-Europe
+            // before Global, and "Switzerland present" picks CH-Switzerland.
+            if (!input.geography?.trim()) {
+                return pickByGeographyFallback(r.rows, input.country, input.region);
+            }
+            return r.rows;
+        }
         // No exact hit → fall through to the fuzzy match below (safety net).
     }
 
@@ -327,29 +339,25 @@ async function layer1Filter(client: any, input: EfMatchInput): Promise<Candidate
 
         const baseWhere = where.length ? where.join(" AND ") : "TRUE";
 
-        // Single query: all material-matching candidates, ORDERED by geography
-        // preference (exact country > region > GLO > RoW > other). Replaces the
-        // old 5-query geography ladder — one query per (unit, domain) combo
-        // instead of ~15, keeping matching fast and the DB connection stable.
-        const country = input.country?.trim()?.replace(/'/g, "''");
-        const region = input.region?.trim()?.replace(/'/g, "''");
-        const geoRank =
-            "CASE " +
-            (country ? `WHEN geography ILIKE '${country}' THEN 5 ` : "") +
-            (region ? `WHEN geography ILIKE '${region}' THEN 4 ` : "") +
-            "WHEN geography ILIKE 'GLO' OR geography ILIKE 'Global' THEN 3 " +
-            "WHEN geography ILIKE 'RoW' OR geography ILIKE 'Rest of%' THEN 2 " +
-            "ELSE 1 END";
-
+        // Geography preference: Country (3) > Region (2) > Global (1) > other (0).
+        // Ranking is applied in JS via geographyFallbackRank so "Belgium" matches
+        // "BE-Belgium" and "Europe" matches "RER-Europe" (plain SQL ILIKE can't).
         const sql = `
             SELECT ${SELECT_COLS}
               FROM emission_factors
              WHERE ${baseWhere}
-             ORDER BY (${geoRank}) DESC, ef_id
+             ORDER BY ef_id
              LIMIT ${MAX_CANDIDATES};
         `;
         const r = await client.query(sql, params);
-        return r.rows;
+        const rows = r.rows as CandidateRow[];
+        if (!input.country && !input.region) return rows;
+        // Sort best geography first; keep full pool for scoring but ordered.
+        return [...rows].sort((a, b) => {
+            const ra = geographyFallbackRank(a.country_code, input.country, input.region);
+            const rb = geographyFallbackRank(b.country_code, input.country, input.region);
+            return rb - ra;
+        });
     };
 
     // Pass 1: domain + unit gates. If that starves the pool, drop the unit gate;
@@ -465,10 +473,15 @@ function matchProcess(row: CandidateRow, input: EfMatchInput, r: Record<string, 
 }
 
 function matchGeography(row: CandidateRow, input: EfMatchInput, r: Record<string, number>): number {
-    if (input.country && ieq(row.country_code, input.country)) return r["same_country"] ?? 0;
-    if (input.region && ieq(row.country_name, input.region)) return r["same_region"] ?? 0;
-    if (ieq(row.country_code, "GLO") || ieq(row.country_name, "Global")) return r["GLO"] ?? 0;
-    if (ieq(row.country_code, "RoW")) return r["RoW"] ?? 0;
+    const geo = row.country_code ?? row.country_name ?? "";
+    const rank = geographyFallbackRank(geo, input.country, input.region);
+    if (rank === 3) return r["same_country"] ?? 0;
+    if (rank === 2) return r["same_region"] ?? 0;
+    if (rank === 1) {
+        if (/glo|global/i.test(geo)) return r["GLO"] ?? r["same_region"] ?? 0;
+        if (/row|rest of/i.test(geo)) return r["RoW"] ?? r["GLO"] ?? 0;
+        return r["GLO"] ?? 0;
+    }
     return 0;
 }
 
