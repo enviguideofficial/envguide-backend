@@ -195,6 +195,48 @@ function q10bUnitsForMpn(data: SupplierData, mpn?: string | null): number {
     return num(rows[0]?.units_produced);
 }
 
+/**
+ * Per Q8 BOM row: scrap kg per declared unit from Q14 (single waste type).
+ *   kg/tonnes: (factoryWasteKg × mass%/100) ÷ Q10b
+ *   %:        (pct/100) × (mass%/100)     // total scrap/comp split by mass %
+ *   no Q14:   0
+ * Deployed weight = material_weight + this scrap.
+ */
+function scrapPerBomRowKg(data: SupplierData): number[] {
+    const bom = data.q8_bom ?? [];
+    const scraps = bom.map(() => 0);
+    const q14Row = (data.q14_production_waste ?? []).find((r) => num(r.quantity) > 0) ?? null;
+    if (!q14Row || bom.length === 0) return scraps;
+
+    const qty = num(q14Row.quantity);
+    const unitRaw = String(q14Row.unit ?? "kg").toLowerCase().trim();
+    const isPercent = unitRaw === "%" || unitRaw === "percent" || unitRaw === "pct";
+    const isTonnes =
+        unitRaw === "t" || unitRaw === "ton" || unitRaw === "tons" ||
+        unitRaw === "tonne" || unitRaw === "tonnes" || unitRaw === "mt";
+
+    if (isPercent) {
+        // Total scrap per component = pct/100 (e.g. 5% → 0.05 kg), then split by mass %.
+        const totalScrapPerComp = qty / 100;
+        for (let i = 0; i < bom.length; i++) {
+            const massPct = num(bom[i].mass_pct);
+            if (massPct <= 0) continue;
+            scraps[i] = totalScrapPerComp * (massPct / 100);
+        }
+        return scraps;
+    }
+
+    const units = q10bUnitsForMpn(data, q14Row.product_id_or_mpn);
+    if (units <= 0) return scraps;
+    const factoryWasteKg = isTonnes ? qty * 1000 : qty;
+    for (let i = 0; i < bom.length; i++) {
+        const massPct = num(bom[i].mass_pct);
+        if (massPct <= 0) continue;
+        scraps[i] = (factoryWasteKg * (massPct / 100)) / units;
+    }
+    return scraps;
+}
+
 const ZERO_STAGE: StageEmissions = {
     fossilGhgEmissions: 0,
     biogenicNonCO2Emissions: 0,
@@ -512,37 +554,43 @@ async function computeAuxiliariesEmission(data: SupplierData, responseId: string
 
 function computeCarbonContent(data: SupplierData): ComputedFields["carbonContent"] {
     const productMass = num(data.main.product_mass_per_declared_unit);
+    const scraps = scrapPerBomRowKg(data);
 
     let biogenicCarbonContent = 0;   // B32 summed — PUBLISHED
     let recycledCarbonContent = 0;   // B37 summed — PUBLISHED
     let totalCarbon = 0;             // B30 — PUBLISHED
     let totalBiogenicCarbonForFossil = 0; // B34 — INTERNAL, only feeds fossil
 
-    for (const row of data.q8_bom) {
-        const componentMass = productMass * (num(row.mass_pct) / 100); // B27  weight kg = productMass × mass%/100
-        const carbonFrac = num(row.carbon_pct) / 100;                  // B28  carbon %
-        const biogenicFrac = num(row.biogenic_carbon_pct) / 100;       // B31  biogenic %
-        const recycledFrac = num(row.recycled_carbon_pct) / 100;       // B35  recycled %
+    data.q8_bom.forEach((row, i) => {
+        const massPct = num(row.mass_pct);
+        const materialWeight = productMass * (massPct / 100); // B36
+        const scrapKg = scraps[i] ?? 0;
+        const deployed = materialWeight + scrapKg; // B37 = B36 + scrap
+        const carbonFrac = num(row.carbon_pct) / 100;                  // B38  carbon %
+        const biogenicFrac = num(row.biogenic_carbon_pct) / 100;       // B41  biogenic %
+        const recycledFrac = num(row.recycled_carbon_pct) / 100;       // B45  recycled %
 
-        const componentCarbon = componentMass * carbonFrac;            // B29  carbon content in kg = weight × carbon%
-        totalCarbon += componentCarbon;                                // B30  Σ carbon content
+        // Carbon / biogenic / recycled all use deployed weight (Excel B37 × %).
+        const componentCarbon = deployed * carbonFrac;                 // B39
+        totalCarbon += componentCarbon;                                // B40  Σ carbon content
 
-        // biogenicCarbonContent (Test 3 rows 32): B32 = weight × biogenic%, summed.
-        const bioInKg = row.biogenic_y_n ? componentMass * biogenicFrac : 0; // B32
+        const bioInKg = row.biogenic_y_n ? deployed * biogenicFrac : 0; // B42
         biogenicCarbonContent += bioInKg;
 
-        // recycledCarbonContent (Test 3 rows 36–37): B36 = weight × recycled%, summed → B37.
-        const recInKg = row.recycled_y_n ? componentMass * recycledFrac : 0; // B36
+        const recInKg = row.recycled_y_n ? deployed * recycledFrac : 0; // B46
         recycledCarbonContent += recInKg;
 
         // Internal "Total Biogenic Carbon" (B34) — NOT published, only used to derive fossil:
         //   B33 = B32/100 (biogenic carbon fraction);  B34 = Σ(carbonContent × B33)
-        const biogenicCarbonFraction = bioInKg / 100;                  // B33
-        totalBiogenicCarbonForFossil += componentCarbon * biogenicCarbonFraction; // B34 term
+        const biogenicCarbonFraction = bioInKg / 100;                  // B43
+        totalBiogenicCarbonForFossil += componentCarbon * biogenicCarbonFraction;
 
-        dbg(`   [carbon] ${row.material}: weight=${componentMass}kg carbon%=${num(row.carbon_pct)} → C=${componentCarbon.toFixed(6)} ` +
-            `(bioInKg=${bioInKg.toFixed(6)}, recInKg=${recInKg.toFixed(6)}, b34term=${(componentCarbon * biogenicCarbonFraction).toFixed(9)})`);
-    }
+        dbg(
+            `   [carbon] ${row.material}: mat=${materialWeight.toFixed(6)}kg + scrap=${scrapKg.toFixed(6)} ` +
+            `→ deployed=${deployed.toFixed(6)}kg carbon%=${num(row.carbon_pct)} → C=${componentCarbon.toFixed(6)} ` +
+            `(bioInKg=${bioInKg.toFixed(6)}, recInKg=${recInKg.toFixed(6)})`
+        );
+    });
 
     // fossilCarbonContent (Test 3 row 38): B38 = Total carbon − Total Recycled − Total Biogenic(B34).
     // NB: subtracts the INTERNAL B34 (tiny), NOT the published biogenicCarbonContent.
@@ -591,11 +639,18 @@ async function computeProductionStage(
     dbg(`\n━━━ PRODUCTION STAGE ━━━  productMass=${productMass}kg  geo=${country}/${region}  year=${year}`);
 
     // --- Q8 materials × EF (fossil)
+    // Emission = deployed_weight × EF, where
+    //   deployed = material_weight (productMass × mass%) + scrap_per_material (from Q14).
     let fossil = 0;
     let materialsFossil = 0; // Q8-only, for the 5-bucket breakdown
-    for (const row of data.q8_bom) {
-        const componentMass = productMass * (num(row.mass_pct) / 100);
-        if (componentMass <= 0) continue;
+    const scraps = scrapPerBomRowKg(data);
+    for (let i = 0; i < data.q8_bom.length; i++) {
+        const row = data.q8_bom[i];
+        const massPct = num(row.mass_pct);
+        const materialWeight = productMass * (massPct / 100);
+        const scrapKg = scraps[i] ?? 0;
+        const deployed = materialWeight + scrapKg;
+        if (deployed <= 0) continue;
         const ef_ = await ef(
             {
                 activityType: "material",
@@ -615,10 +670,13 @@ async function computeProductionStage(
                 responseId,
             }
         );
-        const contrib = componentMass * ef_;
+        const contrib = deployed * ef_;
         fossil += contrib;
         materialsFossil += contrib;
-        dbg(`   [Q8] ${row.material}: ${num(row.mass_pct)}% × ${productMass}kg = ${componentMass}kg × ${ef_} = ${contrib.toFixed(6)} kgCO2e (fossil=${fossil.toFixed(6)})`);
+        dbg(
+            `   [Q8] ${row.material}: mat=${materialWeight.toFixed(6)}kg + scrap=${scrapKg.toFixed(6)} ` +
+            `→ deployed=${deployed.toFixed(6)}kg × EF ${ef_} = ${contrib.toFixed(6)} kgCO2e`
+        );
     }
 
     // --- Q10 electricity — team's Excel methodology (mass-based factory allocation).
@@ -763,28 +821,48 @@ async function computeProductionStage(
         dbg(`   [Q13] ${row.equipment_type || row.item || row.mpn}: ${qty}${row.unit ?? ""} × ${allocFactor.toFixed(8)} (alloc) × ${ef_} = ${contrib.toFixed(6)}`);
     }
 
-    // --- Q14 production / QC waste
+    // --- Q14 production / QC waste (single waste type for now).
+    // waste_per_comp = Σ scrap_per_material (same scraps used in Q8 deployed weight).
+    // emissions = waste_per_comp × EF. Tonnes→kg; % mode as above.
     let wasteFossil = 0; // Q14-only, for the 5-bucket breakdown
-    for (const row of data.q14_production_waste) {
-        const qty = num(row.quantity);
-        if (qty <= 0) continue;
+    const q14Row = (data.q14_production_waste ?? []).find((r) => num(r.quantity) > 0) ?? null;
+    if (q14Row) {
+        const scrapsForWaste = scrapPerBomRowKg(data);
+        const wastePerComponentKg = scrapsForWaste.reduce((s, v) => s + v, 0);
         const ef_ = await ef({
             activityType: "waste",
-            material: row.waste_type,
-            process: row.treatment_type,
-            category: row.category, subCategory: row.sub_category, group: row.group_name, specificType: row.specific_type,
+            material: q14Row.waste_type || q14Row.specific_type || q14Row.category,
+            process: q14Row.treatment_type || q14Row.sub_category,
+            category: q14Row.category,
+            subCategory: q14Row.sub_category,
+            group: q14Row.group_name,
+            specificType: q14Row.specific_type,
             country, region,
-            unit: row.unit, unitKind: "mass",
+            unit: "kg",
+            unitKind: "mass",
             year,
             sourceQuestion: "q14_production_waste",
-            sourceRowId: row.id,
+            sourceRowId: q14Row.id,
             responseId,
         });
-        const contrib = qty * ef_;
-        fossil += contrib;
-        wasteFossil += contrib;
-        dbg(`   [Q14] ${row.waste_type}${row.treatment_type ? ` / ${row.treatment_type}` : ""}: ` +
-            `${qty}${row.unit ?? ""} × ${ef_} = ${contrib.toFixed(6)}`);
+        (data.q8_bom ?? []).forEach((bom, i) => {
+            const scrap = scrapsForWaste[i] ?? 0;
+            if (scrap <= 0) return;
+            dbg(
+                `   [Q14] ${bom.material ?? bom.specific_type ?? "material"} ` +
+                `mass%=${num(bom.mass_pct)}  scrapPerComp=${scrap.toFixed(6)}kg`
+            );
+        });
+        if (wastePerComponentKg > 0) {
+            const contrib = wastePerComponentKg * ef_;
+            fossil += contrib;
+            wasteFossil += contrib;
+            dbg(
+                `   [Q14] waste per component TOTAL = ${wastePerComponentKg.toFixed(6)}kg × EF ${ef_} = ${contrib.toFixed(6)}`
+            );
+        } else {
+            dbg(`   [Q14] no scrap computed (check Q10b units / Q8 mass % / Q14 quantity)`);
+        }
     }
 
     // Q8c / Q14a transport legs live in the logistics (distribution) stage — see
@@ -861,13 +939,16 @@ async function computeProductionStage(
     //   biogenicCarbonFraction (B33) = (weight × biogenic%) / 100   [= biogenic-carbon-in-kg / 100]
     // Same quantity the carbon-content block computes to derive fossil. Test 3 → 0.000683594.
     let totalBiogenicCarbon = 0; // B34
-    for (const row of data.q8_bom) {
-        const componentMass = productMass * (num(row.mass_pct) / 100);          // B27  weight kg
-        const carbonContent = componentMass * (num(row.carbon_pct) / 100);      // B29  carbon content kg
-        const bioInKg = row.biogenic_y_n ? componentMass * (num(row.biogenic_carbon_pct) / 100) : 0; // B32
-        const biogenicCarbonFraction = bioInKg / 100;                           // B33
-        totalBiogenicCarbon += carbonContent * biogenicCarbonFraction;          // B34 term
-    }
+    const scrapsForBio = scrapPerBomRowKg(data);
+    data.q8_bom.forEach((row, i) => {
+        const massPct = num(row.mass_pct);
+        const materialWeight = productMass * (massPct / 100);
+        const deployed = materialWeight + (scrapsForBio[i] ?? 0); // B37
+        const carbonContent = deployed * (num(row.carbon_pct) / 100);      // B39
+        const bioInKg = row.biogenic_y_n ? deployed * (num(row.biogenic_carbon_pct) / 100) : 0;
+        const biogenicCarbonFraction = bioInKg / 100;
+        totalBiogenicCarbon += carbonContent * biogenicCarbonFraction;
+    });
     // Positive value (per Vishnu / Test 3 Excel): uptake = Total Biogenic Carbon × 44/12, no minus.
     const biogenicCO2Uptake = (totalBiogenicCarbon * CO2_PER_C) + biogenicCO2UptakeFromBiomass + biogenicCO2UptakeFromMaterials;
 
