@@ -1071,8 +1071,34 @@ async function computePackagingStage(
             `LUC=${(qty * packLucEf).toFixed(6)}  landMgmt=${(qty * packLandMgmtEf).toFixed(6)}`);
     }
 
-    // Q16a packaging-material transport → logistics (distribution) stage — see
-    // computeDistributionStage. Packaging bucket = Q16 material only (Excel row 75).
+    // Q16a truck/ship/etc. → logistics totals (computeDistributionStage).
+    // Q16a aircraft legs → packagingAircraftGhgEmissions (Catena-X datapoint only).
+    // They stay OUT of packaging PCF so the packaging UI bucket remains Q16 (+Q17 waste).
+    for (const row of data.q16a_packaging_transport ?? []) {
+        if (!transportModeIsAircraft(row)) continue;
+        const dist = num(row.distance_km);
+        const wt = num(row.weight);
+        if (dist <= 0 || wt <= 0) continue;
+        const ef_ = await ef({
+            activityType: "transport",
+            material: row.transport_mode,
+            process: row.transport_mode,
+            category: row.category, subCategory: row.sub_category, group: row.group_name, specificType: row.specific_type,
+            country, region,
+            unit: "tkm", unitKind: "freight",
+            year,
+            sourceQuestion: "q16a_packaging_transport",
+            sourceRowId: row.id,
+            responseId,
+        });
+        const tonnes = weightToTonnes(wt, row.unit);
+        const contribution = dist * tonnes * ef_;
+        aircraft += contribution;
+        dbg(
+            `   [Q16a→packagingAircraft] ${row.transport_mode ?? row.sub_category}: ` +
+            `${dist}km × ${tonnes}t × ${ef_} = ${contribution.toFixed(6)}`
+        );
+    }
 
     // --- Q17 packaging waste
     let packagingWasteFossil = 0; // Q17-only, for the 5-bucket breakdown
@@ -1111,13 +1137,15 @@ async function computePackagingStage(
     packagingLandMgmt *= allocation;
     packagingWasteFossil *= allocation;
 
-    const pcfExcl = fossil + biogenicNonCO2 + aircraft + packagingLuc + packagingLandMgmt;
+    // Packaging PCF = material (+ waste/LUC/land) only — Q16a aircraft is reported
+    // separately as packagingAircraftGhgEmissions and counted in logistics PCF.
+    const pcfExcl = fossil + biogenicNonCO2 + packagingLuc + packagingLandMgmt;
     // uptake is a POSITIVE magnitude (CO2 absorbed) → "including uptake" SUBTRACTS it.
     const pcfIncl = pcfExcl - biogenicCO2Uptake;
 
-    dbg(`   ── packaging totals: fossil=${round6(fossil)} aircraft=${round6(aircraft)} ` +
+    dbg(`   ── packaging totals: fossil=${round6(fossil)} aircraft(Q16a)=${round6(aircraft)} ` +
         `LUC=${round6(packagingLuc)} landMgmt=${round6(packagingLandMgmt)} biogenicUptake=${round6(biogenicCO2Uptake)}`);
-    dbg(`   ── packaging PCF excl=${round6(pcfExcl)}  incl=${round6(pcfIncl)}  (allocation×${allocation})`);
+    dbg(`   ── packaging PCF excl=${round6(pcfExcl)}  incl=${round6(pcfIncl)}  (allocation×${allocation}; aircraft excluded from PCF)`);
 
     return {
         fossilGhgEmissions: round6(fossil),
@@ -1152,7 +1180,11 @@ async function computeDistributionStage(
     dbg(`\n━━━ DISTRIBUTION / LOGISTICS STAGE ━━━`);
     dbg(`   (Q8c + Q14a + Q17a + Q16a + Q19)`);
     let fossil = 0;
-    let aircraft = 0; // distributionStageAircraftGhgEmissions — any air legs
+    // distributionStageAircraftGhgEmissions = Q19 air legs only (not Q16a).
+    let aircraft = 0;
+    // Q16a air still counts in logistics PCF totals, but Catena-X reports it under
+    // packagingAircraftGhgEmissions (computed in packaging stage).
+    let q16aAircraftInLogistics = 0;
 
     // --- Q8c inbound raw-material transport (Excel B65).
     // deployed_t_per_unit = weight_tonnes ÷ Q10b_units; leg = deployed × distance × EF.
@@ -1274,7 +1306,8 @@ async function computeDistributionStage(
     }
 
     // --- Q16a packaging-material transport (Excel packaging-transport block).
-    // Counted in logistics, not packaging — packaging bucket is Q16 material only.
+    // All Q16a → logistics PCF. Aircraft legs do NOT go into distributionStageAircraft*
+    // (that field is Q19-only); Q16a air is reported as packagingAircraftGhgEmissions.
     let q16aTotal = 0;
     for (const row of data.q16a_packaging_transport ?? []) {
         const dist = num(row.distance_km);
@@ -1295,11 +1328,11 @@ async function computeDistributionStage(
         const tonnes = weightToTonnes(wt, row.unit);
         const contribution = dist * tonnes * ef_;
         q16aTotal += contribution;
-        if (transportModeIsAircraft(row)) aircraft += contribution;
+        if (transportModeIsAircraft(row)) q16aAircraftInLogistics += contribution;
         else fossil += contribution;
         dbg(
             `   [Q16a] ${row.transport_mode ?? row.sub_category}: ${dist}km × ${tonnes}t × ${ef_} = ` +
-            `${contribution.toFixed(6)} (${transportModeIsAircraft(row) ? "aircraft" : "fossil"})`
+            `${contribution.toFixed(6)} (${transportModeIsAircraft(row) ? "aircraft→packagingAircraft field" : "fossil"})`
         );
     }
     if (q16aTotal > 0) {
@@ -1307,6 +1340,7 @@ async function computeDistributionStage(
     }
 
     // --- Q19 outbound distribution legs (Excel B170).
+    // Air legs here → distributionStageAircraftGhgEmissions.
     let q19Total = 0;
     for (const row of data.q19_transport_legs) {
         const dist = num(row.distance_km);
@@ -1334,11 +1368,11 @@ async function computeDistributionStage(
         dbg(`   [Q19] distribution transport TOTAL = ${round6(q19Total)} kgCO2e`);
     }
 
-    const pcfExcl = fossil + aircraft;
+    const pcfExcl = fossil + aircraft + q16aAircraftInLogistics;
     dbg(
         `   ── logistics TOTAL = Q8c(${round6(q8cTotal)}) + Q14a(${round6(q14aTotal)}) ` +
         `+ Q17a(${round6(q17aTotal)}) + Q16a(${round6(q16aTotal)}) + Q19(${round6(q19Total)}) ` +
-        `= ${round6(pcfExcl)}  (fossil=${round6(fossil)} aircraft=${round6(aircraft)})`
+        `= ${round6(pcfExcl)}  (fossil=${round6(fossil)} distAircraft/Q19=${round6(aircraft)} q16aAir=${round6(q16aAircraftInLogistics)})`
     );
     return {
         fossilGhgEmissions: round6(fossil),
