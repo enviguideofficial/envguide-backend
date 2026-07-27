@@ -82,7 +82,7 @@ function countryIso(country: string): string | null {
     return COUNTRY_ISO[key] ?? null;
 }
 
-function matchesCountry(geography: string, country: string): boolean {
+export function matchesCountry(geography: string, country: string): boolean {
     const g = norm(geography);
     const c = norm(country);
     if (!g || !c) return false;
@@ -100,7 +100,7 @@ function matchesCountry(geography: string, country: string): boolean {
     return false;
 }
 
-function matchesRegion(geography: string, region: string): boolean {
+export function matchesRegion(geography: string, region: string): boolean {
     const g = norm(geography);
     const r = norm(region);
     if (!g || !r) return false;
@@ -115,7 +115,7 @@ function matchesRegion(geography: string, region: string): boolean {
     });
 }
 
-function matchesGlobal(geography: string): boolean {
+export function matchesGlobal(geography: string): boolean {
     const g = norm(geography);
     return (
         g === "glo" ||
@@ -137,34 +137,58 @@ function matchesGlobal(geography: string): boolean {
 export function geographyFallbackRank(
     geography: string | null | undefined,
     country?: string | null,
-    region?: string | null
+    _region?: string | null  // kept for API compat — fallback order is Country → RER → Global
 ): GeoFallbackRank {
     const g = (geography ?? "").trim();
     if (!g) return 0;
     if (country && matchesCountry(g, country)) return 3;
-    if (region && matchesRegion(g, region)) return 2;
+    // Fixed step 2: RER-Europe (not the supplier's region)
+    if (matchesRegion(g, "europe")) return 2;
     if (matchesGlobal(g)) return 1;
     return 0;
 }
 
 /**
  * From candidates that already match the 4 taxonomy levels, keep only the
- * best geography tier (country → region → global). If nothing ranks > 0,
- * return the original list unchanged.
+ * best geography tier using the fixed fallback order:
+ *   Country (exact) → RER-Europe → Global → (all remaining as last resort)
+ *
+ * When multiple rows survive the winning tier, the HIGHEST kgco2e_per_unit
+ * is returned first (caller picks [0]). This is the conservative / safe pick.
+ *
+ * NOTE: region-based fallback (Asia/RAS etc.) is intentionally skipped.
+ * The designed order is Country → RER-Europe → Global, not Country → Region.
  */
-export function pickByGeographyFallback<T extends { geography?: string | null; country_code?: string | null }>(
+export function pickByGeographyFallback<T extends { geography?: string | null; country_code?: string | null; kgco2e_per_unit?: string | null }>(
     rows: T[],
     country?: string | null,
-    region?: string | null
+    _region?: string | null   // kept for API compat — not used in fallback order
 ): T[] {
     if (!rows.length) return rows;
-    if (!country && !region) return rows;
 
-    const ranked = rows.map((row) => {
-        const geo = row.geography ?? row.country_code ?? "";
-        return { row, rank: geographyFallbackRank(geo, country, region) };
-    });
-    const best = ranked.reduce((m, x) => (x.rank > m ? x.rank : m), 0 as GeoFallbackRank);
-    if (best === 0) return rows;
-    return ranked.filter((x) => x.rank === best).map((x) => x.row);
+    const geo = (row: T) => (row.geography ?? row.country_code ?? "").trim();
+
+    const sortByEfDesc = (arr: T[]): T[] =>
+        [...arr].sort(
+            (a, b) =>
+                parseFloat(b.kgco2e_per_unit ?? "0") -
+                parseFloat(a.kgco2e_per_unit ?? "0")
+        );
+
+    // Step 1: exact country match
+    if (country) {
+        const byCountry = rows.filter((r) => matchesCountry(geo(r), country));
+        if (byCountry.length) return sortByEfDesc(byCountry);
+    }
+
+    // Step 2: RER-Europe (regardless of what region the supplier is in)
+    const byRer = rows.filter((r) => matchesRegion(geo(r), "europe"));
+    if (byRer.length) return sortByEfDesc(byRer);
+
+    // Step 3: Global (GLO / RoW)
+    const byGlobal = rows.filter((r) => matchesGlobal(geo(r)));
+    if (byGlobal.length) return sortByEfDesc(byGlobal);
+
+    // Last resort: return all rows sorted by EF desc so caller's [0] is highest
+    return sortByEfDesc(rows);
 }
