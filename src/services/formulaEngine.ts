@@ -329,7 +329,7 @@ export async function computePcfFields(responseId: string): Promise<ComputedFiel
           }
         : { packagingEmissionsIncluded: false, ...ZERO_STAGE };
 
-    // Logistics / distribution stage = Q8c + Q14a + Q17a + Q19 (Excel: B65+B170+B212+B237).
+    // Logistics / distribution stage = Q8c + Q14a + Q17a + Q16a + Q19.
     // Always computed so these transport legs land in the logistics bucket / distribution
     // datapoints (not production or packaging).
     const distributionIncluded = !!data.main.distribution_stage_included;
@@ -1071,29 +1071,8 @@ async function computePackagingStage(
             `LUC=${(qty * packLucEf).toFixed(6)}  landMgmt=${(qty * packLandMgmtEf).toFixed(6)}`);
     }
 
-    // --- Q16a packaging transport
-    for (const row of data.q16a_packaging_transport) {
-        const dist = num(row.distance_km);
-        const wt = num(row.weight);
-        if (dist <= 0 || wt <= 0) continue;
-        const ef_ = await ef({
-            activityType: "transport",
-            material: row.transport_mode,
-            process: row.transport_mode,
-            category: row.category, subCategory: row.sub_category, group: row.group_name, specificType: row.specific_type,
-            country, region,
-            unit: "tkm", unitKind: "freight",
-            year,
-            sourceQuestion: "q16a_packaging_transport",
-            sourceRowId: row.id,
-            responseId,
-        });
-        const tonnes = weightToTonnes(wt, row.unit);
-        const contribution = dist * tonnes * ef_;
-        if (transportModeIsAircraft(row)) aircraft += contribution;
-        else fossil += contribution;
-        dbg(`   [Q16a] ${row.transport_mode ?? row.sub_category}: ${dist}km × ${tonnes}t × ${ef_} = ${contribution.toFixed(6)} (${transportModeIsAircraft(row) ? "aircraft" : "fossil"})`);
-    }
+    // Q16a packaging-material transport → logistics (distribution) stage — see
+    // computeDistributionStage. Packaging bucket = Q16 material only (Excel row 75).
 
     // --- Q17 packaging waste
     let packagingWasteFossil = 0; // Q17-only, for the 5-bucket breakdown
@@ -1169,9 +1148,9 @@ async function computeDistributionStage(
     const country = primarySite?.country ?? null;
     const region = primarySite?.region ?? null;
 
-    // Excel Logistics = B65(Q8c) + B170(Q19) + B212(Q14a) + B237(Q17a).
+    // Excel Logistics = Q8c + Q14a + Q17a + Q16a (packaging-material transport) + Q19.
     dbg(`\n━━━ DISTRIBUTION / LOGISTICS STAGE ━━━`);
-    dbg(`   (Q8c + Q14a + Q17a + Q19)`);
+    dbg(`   (Q8c + Q14a + Q17a + Q16a + Q19)`);
     let fossil = 0;
     let aircraft = 0; // distributionStageAircraftGhgEmissions — any air legs
 
@@ -1294,6 +1273,39 @@ async function computeDistributionStage(
         dbg(`   [Q17a] packaging waste transport TOTAL = ${round6(q17aTotal)} kgCO2e`);
     }
 
+    // --- Q16a packaging-material transport (Excel packaging-transport block).
+    // Counted in logistics, not packaging — packaging bucket is Q16 material only.
+    let q16aTotal = 0;
+    for (const row of data.q16a_packaging_transport ?? []) {
+        const dist = num(row.distance_km);
+        const wt = num(row.weight);
+        if (dist <= 0 || wt <= 0) continue;
+        const ef_ = await ef({
+            activityType: "transport",
+            material: row.transport_mode,
+            process: row.transport_mode,
+            category: row.category, subCategory: row.sub_category, group: row.group_name, specificType: row.specific_type,
+            country, region,
+            unit: "tkm", unitKind: "freight",
+            year,
+            sourceQuestion: "q16a_packaging_transport",
+            sourceRowId: row.id,
+            responseId,
+        });
+        const tonnes = weightToTonnes(wt, row.unit);
+        const contribution = dist * tonnes * ef_;
+        q16aTotal += contribution;
+        if (transportModeIsAircraft(row)) aircraft += contribution;
+        else fossil += contribution;
+        dbg(
+            `   [Q16a] ${row.transport_mode ?? row.sub_category}: ${dist}km × ${tonnes}t × ${ef_} = ` +
+            `${contribution.toFixed(6)} (${transportModeIsAircraft(row) ? "aircraft" : "fossil"})`
+        );
+    }
+    if (q16aTotal > 0) {
+        dbg(`   [Q16a] packaging material transport TOTAL = ${round6(q16aTotal)} kgCO2e`);
+    }
+
     // --- Q19 outbound distribution legs (Excel B170).
     let q19Total = 0;
     for (const row of data.q19_transport_legs) {
@@ -1325,7 +1337,7 @@ async function computeDistributionStage(
     const pcfExcl = fossil + aircraft;
     dbg(
         `   ── logistics TOTAL = Q8c(${round6(q8cTotal)}) + Q14a(${round6(q14aTotal)}) ` +
-        `+ Q17a(${round6(q17aTotal)}) + Q19(${round6(q19Total)}) ` +
+        `+ Q17a(${round6(q17aTotal)}) + Q16a(${round6(q16aTotal)}) + Q19(${round6(q19Total)}) ` +
         `= ${round6(pcfExcl)}  (fossil=${round6(fossil)} aircraft=${round6(aircraft)})`
     );
     return {
