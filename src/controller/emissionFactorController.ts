@@ -504,8 +504,8 @@ export async function getEmissionFactorStats(_req: any, res: any) {
 //   level=category                          → distinct categories
 //   level=sub_category  (+category)         → distinct sub-categories in it
 //   level=group         (+category,+sub)    → distinct group_name
-//   level=specific_type (+category,+sub,+group) → specific types, each with its
-//                                                ef_id / gwp_100 / unit / geography
+//   level=specific_type (+category,+sub,+group) → distinct specific type names
+//                                                (geography/GWP chosen next)
 // Optional ?q= filters by ILIKE substring. Returns up to 50, sorted. The 4
 // levels together identify exactly one EF row.
 export async function getEfTaxonomy(req: any, res: any) {
@@ -547,14 +547,19 @@ export async function getEfTaxonomy(req: any, res: any) {
             const where = `WHERE ${conds.join(" AND ")} AND ${col} IS NOT NULL AND ${col} <> ''`;
 
             if (level === "specific_type") {
-                // Specific type pins down the exact EF row → return its details.
+                // Distinct type names only — geography (and GWP) vary per country
+                // and are chosen in the next cascade step, so returning every EF
+                // row here produced duplicate labels like many "At the grid".
                 const r = await client.query(
-                    `SELECT specific_type, ef_id, gwp_100, unit, geography
+                    `SELECT DISTINCT specific_type
                        FROM emission_factors ${where}
                       ORDER BY specific_type LIMIT 500`,
                     params
                 );
-                return res.status(200).send({ success: true, data: r.rows });
+                return res.status(200).send({
+                    success: true,
+                    data: r.rows.map((x: any) => ({ specific_type: x.specific_type })),
+                });
             }
             const r = await client.query(
                 `SELECT DISTINCT ${col} AS value FROM emission_factors ${where} ORDER BY ${col} LIMIT 1000`,
