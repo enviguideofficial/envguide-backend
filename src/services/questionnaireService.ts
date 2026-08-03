@@ -164,7 +164,7 @@ export interface QuestionnaireInput {
 export interface SiteRow { siteName?: string; siteAddress?: string; region?: string; country?: string; countrySubdivision?: string; isPrimary?: boolean; notes?: string; }
 export interface BomRow { productIdOrMpn?: string; componentName?: string; material?: string; subCategory?: string; materialGroup?: string; specificType?: string; process?: string; massPct?: number; carbonPct?: number; biogenicYN?: boolean; biogenicCarbonPct?: number; recycledYN?: boolean; recycledCarbonPct?: number; }
 export interface CoProductRow { mpn?: string; componentName?: string; coProductName?: string; coProductPrice?: number; priceCurrency?: string; isPrimaryProduct?: boolean; }
-export interface ElectricityRow { electricityType?: string; generatorType?: string; category?: string; subCategory?: string; materialGroup?: string; specificType?: string; geography?: string; quantity?: number; unit?: string; renewablePct?: number; renewableSourcing?: string; infrastructureEmissionsIncluded?: boolean; }
+export interface ElectricityRow { mpn?: string; electricityType?: string; generatorType?: string; category?: string; subCategory?: string; materialGroup?: string; specificType?: string; geography?: string; quantity?: number; unit?: string; renewablePct?: number; renewableSourcing?: string; infrastructureEmissionsIncluded?: boolean; }
 export interface FactoryProductWeightRow { mpn?: string; totalWeightKg?: number; }
 export interface FactoryProductUnitRow { mpn?: string; unitsProduced?: number; }
 export interface ProcessConsumableRow { mpn?: string; consumableMaterial?: string; category?: string; subCategory?: string; materialGroup?: string; specificType?: string; totalQuantity?: number; unit?: string; }
@@ -180,7 +180,7 @@ export interface RawMaterialTransportRow {
     unit?: string;
     distanceKm?: number;
 }
-export interface FuelRow { fuelCarrier?: string; category?: string; subCategory?: string; materialGroup?: string; specificType?: string; quantity?: number; unit?: string; biogenicYN?: boolean; }
+export interface FuelRow { mpn?: string; fuelCarrier?: string; category?: string; subCategory?: string; materialGroup?: string; specificType?: string; quantity?: number; unit?: string; biogenicYN?: boolean; }
 export interface ProcessGasRow { directProcessGas?: string; quantity?: number; unit?: string; fossilOrBiogenic?: string; }
 export interface QcItRow {
     item?: string;
@@ -474,12 +474,14 @@ export async function saveQuestionnaire(input: QuestionnaireInput): Promise<Save
             ]);
 
             await replaceChildTable(client, "sq_q10_electricity", responseId, input.electricity ?? [], (row, i) => [
+                row.mpn ?? null,
                 row.electricityType ?? null, row.generatorType ?? null,
                 row.category ?? null, row.subCategory ?? null, row.materialGroup ?? null, row.specificType ?? null,
                 row.geography ?? null,
                 row.quantity ?? null, row.unit ?? null,
                 row.renewablePct ?? null, row.renewableSourcing ?? null, row.infrastructureEmissionsIncluded ?? null, i,
             ], [
+                "mpn",
                 "electricity_type", "generator_type",
                 "category", "sub_category", "group_name", "specific_type",
                 "geography",
@@ -522,10 +524,11 @@ export async function saveQuestionnaire(input: QuestionnaireInput): Promise<Save
             ]);
 
             await replaceChildTable(client, "sq_q11_fuels", responseId, input.fuels ?? [], (row, i) => [
+                row.mpn ?? null,
                 row.fuelCarrier ?? null,
                 row.category ?? null, row.subCategory ?? null, row.materialGroup ?? null, row.specificType ?? null,
                 row.quantity ?? null, row.unit ?? null, row.biogenicYN ?? null, i,
-            ], ["fuel_carrier", "category", "sub_category", "group_name", "specific_type", "quantity", "unit", "biogenic_y_n", "row_order"]);
+            ], ["mpn", "fuel_carrier", "category", "sub_category", "group_name", "specific_type", "quantity", "unit", "biogenic_y_n", "row_order"]);
 
             await replaceChildTable(client, "sq_q12_process_gases", responseId, input.processGases ?? [], (row, i) => [
                 row.directProcessGas ?? null, row.quantity ?? null, row.unit ?? null, row.fossilOrBiogenic ?? null, i,
@@ -782,6 +785,7 @@ export async function loadQuestionnaire(responseId: string): Promise<Questionnai
                 isPrimaryProduct: r.is_primary_product,
             })),
             electricity: (await loadChild("sq_q10_electricity")).map((r) => ({
+                mpn: r.mpn,
                 electricityType: r.electricity_type, generatorType: r.generator_type,
                 category: r.category, subCategory: r.sub_category, materialGroup: r.group_name, specificType: r.specific_type,
                 geography: r.geography,
@@ -807,6 +811,7 @@ export async function loadQuestionnaire(responseId: string): Promise<Questionnai
                 weight: numOrUndef(r.weight), unit: r.unit, distanceKm: numOrUndef(r.distance_km),
             })),
             fuels: (await loadChild("sq_q11_fuels")).map((r) => ({
+                mpn: r.mpn,
                 fuelCarrier: r.fuel_carrier,
                 category: r.category, subCategory: r.sub_category, materialGroup: r.group_name, specificType: r.specific_type,
                 quantity: numOrUndef(r.quantity),
