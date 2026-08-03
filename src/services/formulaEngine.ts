@@ -195,29 +195,150 @@ function q10bUnitsForMpn(data: SupplierData, mpn?: string | null): number {
     return num(rows[0]?.units_produced);
 }
 
+/** True when Q10a has a row for this MPN (required to pair with Q10 electricity). */
+function q10aHasMpn(data: SupplierData, mpn?: string | null): boolean {
+    const key = String(mpn ?? "").trim();
+    if (!key) return false;
+    const keyRoot = key.split(/\s*[—–-]/)[0].trim();
+    return (data.q10a_factory_weights ?? []).some((r) => {
+        const m = String(r.mpn ?? "").trim();
+        if (!m) return false;
+        const mRoot = m.split(/\s*[—–-]/)[0].trim();
+        return m === key || mRoot === keyRoot || m.startsWith(keyRoot) || key.startsWith(mRoot);
+    });
+}
+
 /**
- * Per Q8 BOM row: scrap kg per declared unit from Q14 (single waste type).
- *   kg/tonnes: (factoryWasteKg × mass%/100) ÷ Q10b
- *   %:        (pct/100) × (mass%/100)     // total scrap/comp split by mass %
- *   no Q14:   0
+ * Q10b units for an electricity row's MPN — no fallback to another product.
+ * Returns 0 when MPN is missing or has no matching Q10b row.
+ */
+function q10bUnitsForMpnStrict(data: SupplierData, mpn?: string | null): number {
+    const key = String(mpn ?? "").trim();
+    if (!key) return 0;
+    const rows = data.q10b_factory_units ?? [];
+    const keyRoot = key.split(/\s*[—–-]/)[0].trim();
+    const hit = rows.find((r) => {
+        const m = String(r.mpn ?? "").trim();
+        if (!m) return false;
+        const mRoot = m.split(/\s*[—–-]/)[0].trim();
+        return m === key || mRoot === keyRoot || m.startsWith(keyRoot) || key.startsWith(mRoot);
+    });
+    return hit ? num(hit.units_produced) : 0;
+}
+
+/** Q14 rows with a positive quantity. */
+function q14FilledRows(data: SupplierData): any[] {
+    return (data.q14_production_waste ?? []).filter((r) => num(r.quantity) > 0);
+}
+
+function q14UnitFlags(row: any): { isPercent: boolean; isTonnes: boolean } {
+    const unitRaw = String(row?.unit ?? "kg").toLowerCase().trim();
+    return {
+        isPercent: unitRaw === "%" || unitRaw === "percent" || unitRaw === "pct",
+        isTonnes:
+            unitRaw === "t" || unitRaw === "ton" || unitRaw === "tons" ||
+            unitRaw === "tonne" || unitRaw === "tonnes" || unitRaw === "mt",
+    };
+}
+
+/** Factory-level Q14 quantity as kg (0 for % rows — handled separately). */
+function q14FactoryQtyKg(row: any): number {
+    const qty = num(row.quantity);
+    const { isPercent, isTonnes } = q14UnitFlags(row);
+    if (isPercent || qty <= 0) return 0;
+    return isTonnes ? qty * 1000 : qty;
+}
+
+/**
+ * Waste kg per declared unit for one Q14 row (no mass% split).
+ *   kg/tonnes: factoryKg ÷ Q10b
+ *   %:         pct/100
+ */
+function q14WastePerComponentKg(data: SupplierData, row: any): number {
+    const qty = num(row.quantity);
+    if (qty <= 0) return 0;
+    const { isPercent } = q14UnitFlags(row);
+    if (isPercent) return qty / 100;
+    const units = q10bUnitsForMpn(data, row.product_id_or_mpn);
+    if (units <= 0) return 0;
+    return q14FactoryQtyKg(row) / units;
+}
+
+function q14TaxonomyHaystack(row: any): string {
+    return [
+        row?.category, row?.sub_category, row?.group_name, row?.specific_type,
+        row?.waste_type, row?.treatment_type,
+    ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+}
+
+/** Oil / sludge / etc. — never used for deployed material scrap. */
+function isNonMaterialProcessWaste(row: any): boolean {
+    const h = q14TaxonomyHaystack(row);
+    return /\b(oil|sludge|lubricant|solvent|methanol|biodiesel|diesel|gasoline|fuel)\b/i.test(h);
+}
+
+/** Generic words — never material signals. Keep steel/iron/rubber/plastic out of this set. */
+const Q14_MATCH_STOP = new Set([
+    "the", "and", "from", "with", "for", "at", "to", "of", "in", "on", "or", "a", "an",
+    "waste", "treatment", "disposal", "landfill", "incineration", "handling", "other",
+    "percent", "water", "content", "factory", "municipal", "hazardous", "residues",
+    "primarily", "conventional", "average", "mixed", "granulate", "roughing", "turning",
+    "hot", "rolling", "synthetic", "linear", "low", "density", "alloyed", "used",
+    "mineral", "dust", "box", "plant", "scrap", "type", "name", "group",
+]);
+
+function materialMatchTokens(bom: any): string[] {
+    const raw = [
+        bom?.material, bom?.category, bom?.sub_category, bom?.group_name, bom?.specific_type,
+    ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+    const tokens = raw.split(/[^a-z0-9]+/).filter((t) => t.length >= 3 && !Q14_MATCH_STOP.has(t));
+    // Prefer longer/more specific tokens first.
+    return [...new Set(tokens)].sort((a, b) => b.length - a.length);
+}
+
+/**
+ * True when a Q14 row is material scrap for deployed weight:
+ * any of its 4 taxonomy fields relates to a Q8 material (partial token match),
+ * and it is not oil/sludge/process waste.
+ */
+function q14IsMaterialScrapForDeployed(row: any, bomRows: any[]): boolean {
+    if (isNonMaterialProcessWaste(row)) return false;
+    const hay = q14TaxonomyHaystack(row);
+    if (!hay) return false;
+    for (const bom of bomRows) {
+        for (const tok of materialMatchTokens(bom)) {
+            if (hay.includes(tok)) return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Per Q8 BOM row: scrap kg per declared unit from Q14 material-scrap rows only.
  * Deployed weight = material_weight + this scrap.
+ *
+ * Multi-waste:
+ *   • Emissions use ALL Q14 rows (see production stage).
+ *   • Deployed scrap uses only material-matching Q14 rows (oil/sludge excluded).
+ *   • Matching scrap factory kg are summed, then split across BOM by mass% ÷ Q10b
+ *     (Brake Pedal: one scrap row × 80/12/8; Gear: one steel scrap × 100%).
  */
 function scrapPerBomRowKg(data: SupplierData): number[] {
     const bom = data.q8_bom ?? [];
     const scraps = bom.map(() => 0);
-    const q14Row = (data.q14_production_waste ?? []).find((r) => num(r.quantity) > 0) ?? null;
-    if (!q14Row || bom.length === 0) return scraps;
+    const filled = q14FilledRows(data);
+    if (!filled.length || bom.length === 0) return scraps;
 
-    const qty = num(q14Row.quantity);
-    const unitRaw = String(q14Row.unit ?? "kg").toLowerCase().trim();
-    const isPercent = unitRaw === "%" || unitRaw === "percent" || unitRaw === "pct";
-    const isTonnes =
-        unitRaw === "t" || unitRaw === "ton" || unitRaw === "tons" ||
-        unitRaw === "tonne" || unitRaw === "tonnes" || unitRaw === "mt";
-
-    if (isPercent) {
-        // Total scrap per component = pct/100 (e.g. 5% → 0.05 kg), then split by mass %.
-        const totalScrapPerComp = qty / 100;
+    // % mode: first % row drives deployed scrap (split by mass %).
+    const pctRow = filled.find((r) => q14UnitFlags(r).isPercent) ?? null;
+    if (pctRow && (filled.length === 1 || q14IsMaterialScrapForDeployed(pctRow, bom))) {
+        const totalScrapPerComp = num(pctRow.quantity) / 100;
         for (let i = 0; i < bom.length; i++) {
             const massPct = num(bom[i].mass_pct);
             if (massPct <= 0) continue;
@@ -226,9 +347,19 @@ function scrapPerBomRowKg(data: SupplierData): number[] {
         return scraps;
     }
 
-    const units = q10bUnitsForMpn(data, q14Row.product_id_or_mpn);
+    let scrapRows = filled.filter((r) => !q14UnitFlags(r).isPercent && q14IsMaterialScrapForDeployed(r, bom));
+    // Single non-% row (Brake Pedal): always use it for mass% scrap split even if
+    // taxonomy matching is ambiguous — Excel still splits factory waste by mass%.
+    if (!scrapRows.length && filled.filter((r) => !q14UnitFlags(r).isPercent).length === 1) {
+        scrapRows = filled.filter((r) => !q14UnitFlags(r).isPercent);
+    }
+    if (!scrapRows.length) return scraps;
+
+    const units = q10bUnitsForMpn(data, scrapRows[0].product_id_or_mpn);
     if (units <= 0) return scraps;
-    const factoryWasteKg = isTonnes ? qty * 1000 : qty;
+    const factoryWasteKg = scrapRows.reduce((s, r) => s + q14FactoryQtyKg(r), 0);
+    if (factoryWasteKg <= 0) return scraps;
+
     for (let i = 0; i < bom.length; i++) {
         const massPct = num(bom[i].mass_pct);
         if (massPct <= 0) continue;
@@ -679,26 +810,18 @@ async function computeProductionStage(
         );
     }
 
-    // --- Q10 electricity — team's Excel methodology (mass-based factory allocation).
-    // Inputs the supplier gives:
-    //   factory energy = Q10 "Quantity"  (whole-factory kWh for the period)
-    //   factory weight = Σ Q10a rows     (total weight of EVERY product the factory made)
-    //   units          = Q10b            (units of THIS component produced)
-    //   component wt   = product_mass_per_declared_unit (Q3)
-    // Then, per the Excel:
-    //   ① this component's total weight = component_wt × units
-    //   ② electricity for this component = (① ÷ Σ Q10a) × factory energy
-    //   ③ per unit = ② ÷ units   ==  component_wt × factory_energy ÷ Σ Q10a
-    // (units cancel in ③, so the per-unit value doesn't depend on Q10b — but we
-    //  compute ①②③ explicitly and log them so the calc mirrors the methodology doc.)
-    //   emission = ③ × electricity EF × (1 − renewable share)
-    // Legacy fallback: old responses saved before Q10a/Q10b existed used single
-    // main fields — honour them so old data never breaks.
-    const factoryEnergy = num(data.q10_electricity[0]?.quantity) || num(data.main.factory_total_energy_kwh);
+    // --- Q10 electricity — multi-type, Excel mass-based factory allocation.
+    // Per electricity row (Grid Mix, Solar, …), with that row's own qty + EF:
+    //   ① comp total weight = productMass × Q10b(units for this MPN)
+    //   ② utilised kWh     = (① / ΣQ10a) × row.quantity
+    //   ③ per-unit kWh     = ② / Q10b  == productMass × qty / ΣQ10a
+    //   emission           = ③ × EF × (1 − renewable%)
+    // Total electricity emission = sum of all rows.
+    // MPN is mandatory: row must match Q10a + Q10b or it is skipped.
     const q10aSum = data.q10a_factory_weights.reduce((s: number, r: any) => s + num(r.total_weight_kg), 0);
     const factoryWeight = q10aSum > 0 ? q10aSum : num(data.main.factory_total_weight_kg);
     // productMass (declared above) is the component's per-unit mass from Q3c.
-    const useFactoryAllocation = factoryEnergy > 0 && factoryWeight > 0 && productMass > 0;
+    const useFactoryAllocation = factoryWeight > 0 && productMass > 0;
 
     // The SAME factory→component mass allocation applies to every factory-level
     // production input, not just electricity: fuel (Q11), process gas (Q12) and
@@ -710,31 +833,59 @@ async function computeProductionStage(
     // missing — same guard as electricity, so old data never breaks.
     const allocFactor = useFactoryAllocation ? productMass / factoryWeight : 1;
 
+    let q10Total = 0;
     if (useFactoryAllocation && data.q10_electricity.length > 0) {
-        const elecRow = data.q10_electricity[0]; // primary electricity source → EF
-        const units = num(data.q10b_factory_units[0]?.units_produced); // Q10b (for the audit steps)
-        const componentTotalWeight = productMass * units;                        // ①
-        const componentElectricity = (componentTotalWeight / factoryWeight) * factoryEnergy; // ②
-        const perUnitKwh = (productMass * factoryEnergy) / factoryWeight;        // ③ (units cancel)
-        const ef_ = await ef({
-            activityType: "energy",
-            material: elecRow.electricity_type,
-            process: elecRow.generator_type,
-            category: elecRow.category, subCategory: elecRow.sub_category, group: elecRow.group_name, specificType: elecRow.specific_type,
-            geography: elecRow.geography, // 5th cascade pin (Q10) → exact country EF
-            country, region,
-            unit: elecRow.unit, unitKind: "energy",
-            year,
-            sourceQuestion: "q10_electricity",
-            sourceRowId: elecRow.id,
-            responseId,
-        });
-        const renewableShare = (num(elecRow.renewable_pct) / 100) || 0;
-        const contrib = perUnitKwh * ef_ * (1 - renewableShare);
-        fossil += contrib;
-        dbg(`   [Q10] factoryEnergy(Q10)=${factoryEnergy}kWh  ΣQ10a=${factoryWeight}kg  units(Q10b)=${units}  compWt=${productMass}kg`);
-        dbg(`   [Q10-steps] ①compTotWt=${productMass}×${units}=${componentTotalWeight.toFixed(4)}kg  ②elec=(${componentTotalWeight.toFixed(4)}/${factoryWeight})×${factoryEnergy}=${componentElectricity.toFixed(4)}kWh  ③perUnit=${perUnitKwh.toFixed(6)}kWh`);
-        dbg(`   [Q10-alloc] ${perUnitKwh.toFixed(6)}kWh × EF ${ef_} × (1−${renewableShare}) = ${contrib.toFixed(6)} kgCO2e`);
+        dbg(`   [Q10] ΣQ10a=${factoryWeight}kg  compWt=${productMass}kg  rows=${data.q10_electricity.length}`);
+        for (const elecRow of data.q10_electricity) {
+            const factoryEnergy = num(elecRow.quantity);
+            if (factoryEnergy <= 0) continue;
+
+            const mpn = String(elecRow.mpn ?? "").trim();
+            if (!mpn) {
+                dbg(`   [Q10] skip row — MPN is required`);
+                continue;
+            }
+            if (!q10aHasMpn(data, mpn)) {
+                dbg(`   [Q10] skip MPN="${mpn}" — no matching Q10a row`);
+                continue;
+            }
+            const units = q10bUnitsForMpnStrict(data, mpn);
+            if (units <= 0) {
+                dbg(`   [Q10] skip MPN="${mpn}" — no matching Q10b units`);
+                continue;
+            }
+
+            const componentTotalWeight = productMass * units; // ①
+            const componentElectricity = (componentTotalWeight / factoryWeight) * factoryEnergy; // ②
+            // ③ units cancel: perUnit = productMass × factoryEnergy / factoryWeight
+            const perUnitKwh = (productMass * factoryEnergy) / factoryWeight;
+            const ef_ = await ef({
+                activityType: "energy",
+                material: elecRow.electricity_type,
+                process: elecRow.generator_type,
+                category: elecRow.category, subCategory: elecRow.sub_category, group: elecRow.group_name, specificType: elecRow.specific_type,
+                geography: elecRow.geography,
+                country, region,
+                unit: elecRow.unit, unitKind: "energy",
+                year,
+                sourceQuestion: "q10_electricity",
+                sourceRowId: elecRow.id,
+                responseId,
+            });
+            const renewableShare = (num(elecRow.renewable_pct) / 100) || 0;
+            const contrib = perUnitKwh * ef_ * (1 - renewableShare);
+            fossil += contrib;
+            q10Total += contrib;
+            const label =
+                elecRow.specific_type || elecRow.sub_category || elecRow.electricity_type || "electricity";
+            dbg(
+                `   [Q10] ${label} MPN=${mpn} qty=${factoryEnergy}${elecRow.unit ?? "kWh"} ` +
+                `units(Q10b)=${units} ①=${componentTotalWeight.toFixed(4)}kg ` +
+                `②=${componentElectricity.toFixed(4)}kWh ③=${perUnitKwh.toFixed(6)}kWh ` +
+                `× EF ${ef_} × (1−${renewableShare}) = ${contrib.toFixed(6)}`
+            );
+        }
+        dbg(`   [Q10] electricity TOTAL = ${round6(q10Total)} kgCO2e`);
     } else {
         for (const row of data.q10_electricity) {
             const qty = num(row.quantity);
@@ -744,7 +895,7 @@ async function computeProductionStage(
                 material: row.electricity_type,
                 process: row.generator_type,
                 category: row.category, subCategory: row.sub_category, group: row.group_name, specificType: row.specific_type,
-                geography: row.geography, // 5th cascade pin (Q10) → exact country EF
+                geography: row.geography,
                 country, region,
                 unit: row.unit, unitKind: "energy",
                 year,
@@ -755,16 +906,34 @@ async function computeProductionStage(
             const renewableShare = (num(row.renewable_pct) / 100) || 0;
             const contrib = qty * ef_ * (1 - renewableShare);
             fossil += contrib;
+            q10Total += contrib;
             dbg(`   [Q10] ${row.electricity_type}: ${qty}${row.unit} × ${ef_} × (1−${renewableShare}) = ${contrib.toFixed(6)}`);
         }
     }
 
-    // --- Q11 fuels  (biogenic ones go into biogenicNonCO2 below)
-    // Vishnu (Teams, 2026-07-09): Q11 fuels + Q13 QC/IT MUST be INCLUDED in production emission.
+    // --- Q11 fuels / energy carriers (multi-row).
+    // Per Excel (updated): per component = quantity ÷ Q10b(units for this MPN)
+    //   emission = perComponent × EF
+    // Total = sum of all fuel rows. MPN required; must match Q10b or row is skipped.
+    // Biogenic rows go to biogenicNonCO2; others to fossil.
     let biogenicNonCO2 = 0;
+    let q11Total = 0;
     for (const row of data.q11_fuels) {
         const qty = num(row.quantity);
         if (qty <= 0) continue;
+
+        const mpn = String(row.mpn ?? "").trim();
+        if (!mpn) {
+            dbg(`   [Q11] skip row — MPN is required`);
+            continue;
+        }
+        const units = q10bUnitsForMpnStrict(data, mpn);
+        if (units <= 0) {
+            dbg(`   [Q11] skip MPN="${mpn}" — no matching Q10b units`);
+            continue;
+        }
+
+        const perComponent = qty / units; // B130 / B102
         const ef_ = await ef({
             activityType: "fuels",
             material: row.fuel_carrier,
@@ -776,11 +945,18 @@ async function computeProductionStage(
             sourceRowId: row.id,
             responseId,
         });
-        const contrib = qty * allocFactor * ef_;
+        const contrib = perComponent * ef_;
         if (row.biogenic_y_n) biogenicNonCO2 += contrib;
         else fossil += contrib;
-        dbg(`   [Q11] ${row.fuel_carrier}: ${qty}${row.unit ?? ""} × ${allocFactor.toFixed(8)} (alloc) × ${ef_} = ${contrib.toFixed(6)} ` +
-            `(${row.biogenic_y_n ? "biogenicNonCO2" : "fossil"})`);
+        q11Total += contrib;
+        const label = row.specific_type || row.fuel_carrier || row.sub_category || "fuel";
+        dbg(
+            `   [Q11] ${label} MPN=${mpn}: ${qty}${row.unit ?? ""} ÷ ${units} (Q10b) = ${perComponent.toFixed(6)} ` +
+            `× EF ${ef_} = ${contrib.toFixed(6)} (${row.biogenic_y_n ? "biogenicNonCO2" : "fossil"})`
+        );
+    }
+    if (data.q11_fuels.length > 0) {
+        dbg(`   [Q11] fuels TOTAL = ${round6(q11Total)} kgCO2e`);
     }
 
     // --- Q12 process gases — emission = quantity × allocFactor × GWP (AR6), NOT an EF lookup.
@@ -821,48 +997,59 @@ async function computeProductionStage(
         dbg(`   [Q13] ${row.equipment_type || row.item || row.mpn}: ${qty}${row.unit ?? ""} × ${allocFactor.toFixed(8)} (alloc) × ${ef_} = ${contrib.toFixed(6)}`);
     }
 
-    // --- Q14 production / QC waste (single waste type for now).
-    // waste_per_comp = Σ scrap_per_material (same scraps used in Q8 deployed weight).
-    // emissions = waste_per_comp × EF. Tonnes→kg; % mode as above.
+    // --- Q14 production / QC waste (multi-waste).
+    // Emissions: EVERY filled Q14 row → (qty→kg ÷ Q10b) × that row's EF, then sum.
+    // Deployed scrap (Q8) uses material-matching rows only — see scrapPerBomRowKg.
     let wasteFossil = 0; // Q14-only, for the 5-bucket breakdown
-    const q14Row = (data.q14_production_waste ?? []).find((r) => num(r.quantity) > 0) ?? null;
-    if (q14Row) {
-        const scrapsForWaste = scrapPerBomRowKg(data);
-        const wastePerComponentKg = scrapsForWaste.reduce((s, v) => s + v, 0);
-        const ef_ = await ef({
-            activityType: "waste",
-            material: q14Row.waste_type || q14Row.specific_type || q14Row.category,
-            process: q14Row.treatment_type || q14Row.sub_category,
-            category: q14Row.category,
-            subCategory: q14Row.sub_category,
-            group: q14Row.group_name,
-            specificType: q14Row.specific_type,
-            country, region,
-            unit: "kg",
-            unitKind: "mass",
-            year,
-            sourceQuestion: "q14_production_waste",
-            sourceRowId: q14Row.id,
-            responseId,
-        });
+    const q14Filled = q14FilledRows(data);
+    if (q14Filled.length) {
+        const scrapsForDeployed = scrapPerBomRowKg(data);
         (data.q8_bom ?? []).forEach((bom, i) => {
-            const scrap = scrapsForWaste[i] ?? 0;
+            const scrap = scrapsForDeployed[i] ?? 0;
             if (scrap <= 0) return;
             dbg(
-                `   [Q14] ${bom.material ?? bom.specific_type ?? "material"} ` +
+                `   [Q14] deployed scrap → ${bom.material ?? bom.specific_type ?? "material"} ` +
                 `mass%=${num(bom.mass_pct)}  scrapPerComp=${scrap.toFixed(6)}kg`
             );
         });
-        if (wastePerComponentKg > 0) {
+        dbg(
+            `   [Q14] deployed scrap TOTAL = ${scrapsForDeployed.reduce((s, v) => s + v, 0).toFixed(6)}kg ` +
+            `(material-matching rows only)`
+        );
+
+        for (const q14Row of q14Filled) {
+            const wastePerComponentKg = q14WastePerComponentKg(data, q14Row);
+            if (wastePerComponentKg <= 0) {
+                dbg(`   [Q14] skip row id=${q14Row.id}: no per-comp kg (check Q10b / qty)`);
+                continue;
+            }
+            const ef_ = await ef({
+                activityType: "waste",
+                material: q14Row.waste_type || q14Row.specific_type || q14Row.category,
+                process: q14Row.treatment_type || q14Row.sub_category,
+                category: q14Row.category,
+                subCategory: q14Row.sub_category,
+                group: q14Row.group_name,
+                specificType: q14Row.specific_type,
+                country, region,
+                unit: "kg",
+                unitKind: "mass",
+                year,
+                sourceQuestion: "q14_production_waste",
+                sourceRowId: q14Row.id,
+                responseId,
+            });
             const contrib = wastePerComponentKg * ef_;
             fossil += contrib;
             wasteFossil += contrib;
+            const label =
+                q14Row.specific_type || q14Row.group_name || q14Row.waste_type || q14Row.category || "waste";
             dbg(
-                `   [Q14] waste per component TOTAL = ${wastePerComponentKg.toFixed(6)}kg × EF ${ef_} = ${contrib.toFixed(6)}`
+                `   [Q14] ${label}: ${wastePerComponentKg.toFixed(6)}kg/comp × EF ${ef_} = ${contrib.toFixed(6)}` +
+                (q14IsMaterialScrapForDeployed(q14Row, data.q8_bom ?? []) ? " [deployed]" : " [emissions-only]")
             );
-        } else {
-            dbg(`   [Q14] no scrap computed (check Q10b units / Q8 mass % / Q14 quantity)`);
         }
+        dbg(`   [Q14] waste emissions TOTAL = ${round6(wasteFossil)} kgCO2e`);
     }
 
     // Q8c / Q14a transport legs live in the logistics (distribution) stage — see

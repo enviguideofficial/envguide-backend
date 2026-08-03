@@ -3928,12 +3928,14 @@ ADD COLUMN IF NOT EXISTS ef_code VARCHAR(255);
             ADD COLUMN IF NOT EXISTS sub_category TEXT,
             ADD COLUMN IF NOT EXISTS group_name TEXT,
             ADD COLUMN IF NOT EXISTS specific_type TEXT,
-            ADD COLUMN IF NOT EXISTS geography TEXT;`,
+            ADD COLUMN IF NOT EXISTS geography TEXT,
+            ADD COLUMN IF NOT EXISTS mpn TEXT;`,
         `ALTER TABLE sq_q11_fuels
             ADD COLUMN IF NOT EXISTS category TEXT,
             ADD COLUMN IF NOT EXISTS sub_category TEXT,
             ADD COLUMN IF NOT EXISTS group_name TEXT,
-            ADD COLUMN IF NOT EXISTS specific_type TEXT;`,
+            ADD COLUMN IF NOT EXISTS specific_type TEXT,
+            ADD COLUMN IF NOT EXISTS mpn TEXT;`,
         `ALTER TABLE sq_q13_qc_it_energy
             ADD COLUMN IF NOT EXISTS category TEXT,
             ADD COLUMN IF NOT EXISTS sub_category TEXT,
