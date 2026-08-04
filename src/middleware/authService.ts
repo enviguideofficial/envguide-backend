@@ -49,6 +49,7 @@ export async function authenticate(req: any, res: any, next: any) {
             if (findUser.rows.length > 0) {
                 req.user_id = findUser.rows[0].user_id
                 req.role_id = findUser.rows[0].user_role_id
+                await authService.touchUserSessionActivity(req.user_id)
                 // req.store_id = findUser.rows[0].user_store_id
                 next();
             } else {

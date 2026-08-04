@@ -18,10 +18,12 @@ userRoutes.get('/api/roles/get', userController.getRoles)
 userRoutes.get('/api/department/get', userController.getDeparmment)
 
 userRoutes.get('/api/user/getAll', userController.getAllUser)
+userRoutes.get('/api/user/active-logins', authService.authenticate, userController.getActiveLoginMonitoring)
 
 userRoutes.get('/api/user/getById', userController.getUserById)
 
 userRoutes.post('/api/user/update', userController.updateUser)
+userRoutes.post('/api/user/logout', authService.authenticate, userController.logoutUserSession)
 
 userRoutes.post('/api/user/permission/add', authService.authenticate, userController.addUserPermission)
 
