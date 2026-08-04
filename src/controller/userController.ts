@@ -252,6 +252,8 @@ export async function verifyMFA(req: any, res: any) {
         return res.status(401).json({ success: false, message: "Invalid or expired MFA code" });
     }
 
+    await userService.recordLoginSuccess(findUser.rows[0].user_id);
+
     // Issue final JWT after MFA success
     const jwttoken = generateAccessToken({
         email: findUser.rows[0].user_email,
@@ -648,6 +650,36 @@ export async function getAllUser(req: any, res: any) {
         }
     }
     catch (error: any) {
+        return res.status(400).send(generateResponse(false, error.message, 400, null));
+    }
+}
+
+export async function getActiveLoginMonitoring(req: any, res: any) {
+    try {
+        const getActiveUsers = await userService.getActiveLoginMonitoring(req.query);
+        return res.status(200).send(
+            generateResponse(true, "active users fetched successfully", 200, {
+                totalCount: getActiveUsers.totalRowsCount,
+                userList: getActiveUsers.userList
+            })
+        );
+    } catch (error: any) {
+        return res.status(400).send(generateResponse(false, error.message, 400, null));
+    }
+}
+
+export async function logoutUserSession(req: any, res: any) {
+    try {
+        if (!req.user_id) {
+            return res.status(400).send(generateResponse(false, "user not authenticated", 400, null));
+        }
+
+        await userService.markUserLoggedOut(req.user_id);
+
+        return res.status(200).send(
+            generateResponse(true, "user logged out successfully", 200, null)
+        );
+    } catch (error: any) {
         return res.status(400).send(generateResponse(false, error.message, 400, null));
     }
 }

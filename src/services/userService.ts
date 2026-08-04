@@ -1,6 +1,16 @@
 import { withClient } from '../util/database.js';
 import { ulid } from 'ulid';
 
+async function ensureLoginMonitoringColumns(client: any) {
+    await client.query(`
+        ALTER TABLE users_table
+        ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS login_count INTEGER NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS is_logged_in BOOLEAN NOT NULL DEFAULT false,
+        ADD COLUMN IF NOT EXISTS session_last_activity_at TIMESTAMPTZ;
+    `);
+}
+
 
 export async function finduser(user_email: any) {
     return withClient(async (client: any) => {
@@ -54,6 +64,121 @@ export async function findUserByMultiple(user_email: any) {
             throw new Error(error)
         }
     })
+}
+
+export async function recordLoginSuccess(user_id: string) {
+    return withClient(async (client: any) => {
+        await ensureLoginMonitoringColumns(client);
+        const query = `
+            UPDATE users_table
+            SET
+                last_login_at = CURRENT_TIMESTAMP,
+                login_count = COALESCE(login_count, 0) + 1,
+                is_logged_in = true,
+                session_last_activity_at = CURRENT_TIMESTAMP,
+                update_date = CURRENT_TIMESTAMP
+            WHERE user_id = $1
+            RETURNING user_id;
+        `;
+        return client.query(query, [user_id]);
+    });
+}
+
+export async function markUserLoggedOut(user_id: string) {
+    return withClient(async (client: any) => {
+        await ensureLoginMonitoringColumns(client);
+        const query = `
+            UPDATE users_table
+            SET
+                is_logged_in = false,
+                session_last_activity_at = CURRENT_TIMESTAMP,
+                update_date = CURRENT_TIMESTAMP
+            WHERE user_id = $1
+            RETURNING user_id;
+        `;
+        return client.query(query, [user_id]);
+    });
+}
+
+export async function touchUserSessionActivity(user_id: string) {
+    return withClient(async (client: any) => {
+        await ensureLoginMonitoringColumns(client);
+        const query = `
+            UPDATE users_table
+            SET
+                is_logged_in = true,
+                session_last_activity_at = CURRENT_TIMESTAMP,
+                update_date = CURRENT_TIMESTAMP
+            WHERE user_id = $1
+            RETURNING user_id;
+        `;
+        return client.query(query, [user_id]);
+    });
+}
+
+export async function getActiveLoginMonitoring(query: any) {
+    return withClient(async (client: any) => {
+        const {
+            pageNumber = 1,
+            pageSize = 10,
+            searchValue = "",
+            role = ""
+        } = query;
+
+        await ensureLoginMonitoringColumns(client);
+
+        const page = Math.max(Number(pageNumber) || 1, 1);
+        const limit = Math.max(Number(pageSize) || 10, 1);
+        const offset = (page - 1) * limit;
+
+        const whereParts: string[] = ['is_logged_in = true'];
+        const params: any[] = [];
+        let i = 1;
+
+        if (searchValue) {
+            whereParts.push(`(
+                user_name ILIKE $${i}
+                OR user_email ILIKE $${i}
+                OR user_phone_number ILIKE $${i}
+            )`);
+            params.push(`%${searchValue}%`);
+            i++;
+        }
+
+        if (role) {
+            whereParts.push(`user_role ILIKE $${i}`);
+            params.push(role);
+            i++;
+        }
+
+        const whereClause = `WHERE ${whereParts.join(' AND ')}`;
+        const countQuery = `SELECT COUNT(*)::int AS total FROM users_table ${whereClause}`;
+        const listQuery = `
+            SELECT
+                user_id,
+                user_name,
+                user_role,
+                user_email,
+                user_phone_number,
+                login_count,
+                last_login_at,
+                is_logged_in,
+                session_last_activity_at
+            FROM users_table
+            ${whereClause}
+            ORDER BY last_login_at DESC NULLS LAST
+            OFFSET $${i}
+            LIMIT $${i + 1};
+        `;
+
+        const countResult = await client.query(countQuery, params);
+        const listResult = await client.query(listQuery, [...params, offset, limit]);
+
+        return {
+            totalRowsCount: countResult.rows[0]?.total || 0,
+            userList: listResult.rows
+        };
+    });
 }
 
 
