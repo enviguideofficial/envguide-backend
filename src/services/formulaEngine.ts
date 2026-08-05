@@ -226,9 +226,45 @@ function q10bUnitsForMpnStrict(data: SupplierData, mpn?: string | null): number 
     return hit ? num(hit.units_produced) : 0;
 }
 
-/** Q14 rows with a positive quantity. */
-function q14FilledRows(data: SupplierData): any[] {
-    return (data.q14_production_waste ?? []).filter((r) => num(r.quantity) > 0);
+/** Σ Q10a factory weight (kg), with legacy main-field fallback. */
+function q10aFactoryWeightKg(data: SupplierData): number {
+    const q10aSum = (data.q10a_factory_weights ?? []).reduce(
+        (s: number, r: any) => s + num(r.total_weight_kg),
+        0,
+    );
+    return q10aSum > 0 ? q10aSum : num(data.main.factory_total_weight_kg);
+}
+
+/**
+ * Excel B103 — share of this component in factory-level weight (as a fraction).
+ *   (productMass × Q10b) / ΣQ10a
+ * e.g. Brake Pedal: (2 × 1500) / 25000 = 0.12 → 12%.
+ */
+function componentFactoryWeightShare(data: SupplierData, mpn?: string | null): number {
+    const productMass = num(data.main.product_mass_per_declared_unit);
+    const factoryWeight = q10aFactoryWeightKg(data);
+    const units = q10bUnitsForMpn(data, mpn);
+    if (productMass <= 0 || factoryWeight <= 0 || units <= 0) return 0;
+    return (productMass * units) / factoryWeight;
+}
+
+/** True when Q14 has all 4 EF taxonomy fields (needed to fetch an EF). */
+function q14HasTaxonomy(row: any): boolean {
+    return [row?.category, row?.sub_category, row?.group_name, row?.specific_type]
+        .every((v) => String(v ?? "").trim() !== "");
+}
+
+/**
+ * Q14 rows that participate in calc:
+ *   • quantity > 0 (kg / tonnes / %), or
+ *   • quantity blank/0 but all 4 taxonomy fields filled → default 10% × Q10a
+ * No taxonomy and no quantity → skipped (cannot fetch EF; no default waste type).
+ */
+function q14ActiveRows(data: SupplierData): any[] {
+    return (data.q14_production_waste ?? []).filter((r) => {
+        if (num(r.quantity) > 0) return true;
+        return q14HasTaxonomy(r);
+    });
 }
 
 function q14UnitFlags(row: any): { isPercent: boolean; isTonnes: boolean } {
@@ -241,27 +277,44 @@ function q14UnitFlags(row: any): { isPercent: boolean; isTonnes: boolean } {
     };
 }
 
-/** Factory-level Q14 quantity as kg (0 for % rows — handled separately). */
-function q14FactoryQtyKg(row: any): number {
+/**
+ * Factory-level Q14 quantity as kg.
+ *   kg:      as entered
+ *   tonnes:  × 1000
+ *   %:       (pct/100) × ΣQ10a   e.g. 40% × 25000 = 10000 kg
+ *   blank qty + taxonomy: 10% × ΣQ10a  (Excel default)
+ */
+function q14FactoryQtyKg(data: SupplierData, row: any): number {
     const qty = num(row.quantity);
+    const factoryWeight = q10aFactoryWeightKg(data);
     const { isPercent, isTonnes } = q14UnitFlags(row);
-    if (isPercent || qty <= 0) return 0;
-    return isTonnes ? qty * 1000 : qty;
+
+    if (qty > 0) {
+        if (isPercent) {
+            if (factoryWeight <= 0) return 0;
+            return (qty / 100) * factoryWeight;
+        }
+        return isTonnes ? qty * 1000 : qty;
+    }
+
+    // No quantity: default 10% of factory weight — only when taxonomy exists for EF.
+    if (!q14HasTaxonomy(row) || factoryWeight <= 0) return 0;
+    return 0.10 * factoryWeight;
 }
 
 /**
  * Waste kg per declared unit for one Q14 row (no mass% split).
- *   kg/tonnes: factoryKg ÷ Q10b
- *   %:         pct/100
+ *   factoryKg (kg / tonnes / %→kg / default 10%) × componentShare ÷ Q10b
+ *   componentShare = (productMass × Q10b) / ΣQ10a  (Excel B103)
  */
 function q14WastePerComponentKg(data: SupplierData, row: any): number {
-    const qty = num(row.quantity);
-    if (qty <= 0) return 0;
-    const { isPercent } = q14UnitFlags(row);
-    if (isPercent) return qty / 100;
     const units = q10bUnitsForMpn(data, row.product_id_or_mpn);
     if (units <= 0) return 0;
-    return q14FactoryQtyKg(row) / units;
+    const share = componentFactoryWeightShare(data, row.product_id_or_mpn);
+    if (share <= 0) return 0;
+    const factoryWasteKg = q14FactoryQtyKg(data, row);
+    if (factoryWasteKg <= 0) return 0;
+    return (factoryWasteKg * share) / units;
 }
 
 function q14TaxonomyHaystack(row: any): string {
@@ -323,47 +376,47 @@ function q14IsMaterialScrapForDeployed(row: any, bomRows: any[]): boolean {
  * Per Q8 BOM row: scrap kg per declared unit from Q14 material-scrap rows only.
  * Deployed weight = material_weight + this scrap.
  *
+ * kg / tonnes / % (Excel Brake Pedal):
+ *   ① if blank qty + taxonomy: factoryWasteKg = 10% × ΣQ10a  e.g. 2500
+ *      if %: factoryWasteKg = (pct/100) × ΣQ10a
+ *      if kg/tonnes: as entered
+ *   ② componentShare = (productMass × Q10b) / ΣQ10a  e.g. 12%
+ *   ③ componentWaste = factoryWasteKg × share        e.g. 2500 × 12% = 300
+ *   ④ scrap_i        = (③ × mass%) / Q10b           e.g. 240/1500 = 0.16
+ *
  * Multi-waste:
- *   • Emissions use ALL Q14 rows (see production stage).
+ *   • Emissions use ALL active Q14 rows (see production stage).
  *   • Deployed scrap uses only material-matching Q14 rows (oil/sludge excluded).
- *   • Matching scrap factory kg are summed, then split across BOM by mass% ÷ Q10b
- *     (Brake Pedal: one scrap row × 80/12/8; Gear: one steel scrap × 100%).
+ *   • No taxonomy and no quantity → row skipped (no default waste EF type).
  */
 function scrapPerBomRowKg(data: SupplierData): number[] {
     const bom = data.q8_bom ?? [];
     const scraps = bom.map(() => 0);
-    const filled = q14FilledRows(data);
+    const filled = q14ActiveRows(data);
     if (!filled.length || bom.length === 0) return scraps;
 
-    // % mode: first % row drives deployed scrap (split by mass %).
-    const pctRow = filled.find((r) => q14UnitFlags(r).isPercent) ?? null;
-    if (pctRow && (filled.length === 1 || q14IsMaterialScrapForDeployed(pctRow, bom))) {
-        const totalScrapPerComp = num(pctRow.quantity) / 100;
-        for (let i = 0; i < bom.length; i++) {
-            const massPct = num(bom[i].mass_pct);
-            if (massPct <= 0) continue;
-            scraps[i] = totalScrapPerComp * (massPct / 100);
-        }
-        return scraps;
-    }
-
-    let scrapRows = filled.filter((r) => !q14UnitFlags(r).isPercent && q14IsMaterialScrapForDeployed(r, bom));
-    // Single non-% row (Brake Pedal): always use it for mass% scrap split even if
+    let scrapRows = filled.filter((r) => q14IsMaterialScrapForDeployed(r, bom));
+    // Single waste row (Brake Pedal): always use it for mass% scrap split even if
     // taxonomy matching is ambiguous — Excel still splits factory waste by mass%.
-    if (!scrapRows.length && filled.filter((r) => !q14UnitFlags(r).isPercent).length === 1) {
-        scrapRows = filled.filter((r) => !q14UnitFlags(r).isPercent);
+    if (!scrapRows.length && filled.length === 1) {
+        scrapRows = filled;
     }
     if (!scrapRows.length) return scraps;
 
-    const units = q10bUnitsForMpn(data, scrapRows[0].product_id_or_mpn);
+    const mpn = scrapRows[0].product_id_or_mpn;
+    const units = q10bUnitsForMpn(data, mpn);
     if (units <= 0) return scraps;
-    const factoryWasteKg = scrapRows.reduce((s, r) => s + q14FactoryQtyKg(r), 0);
+    const share = componentFactoryWeightShare(data, mpn);
+    if (share <= 0) return scraps;
+
+    const factoryWasteKg = scrapRows.reduce((s, r) => s + q14FactoryQtyKg(data, r), 0);
     if (factoryWasteKg <= 0) return scraps;
+    const componentWasteKg = factoryWasteKg * share;
 
     for (let i = 0; i < bom.length; i++) {
         const massPct = num(bom[i].mass_pct);
         if (massPct <= 0) continue;
-        scraps[i] = (factoryWasteKg * (massPct / 100)) / units;
+        scraps[i] = (componentWasteKg * (massPct / 100)) / units;
     }
     return scraps;
 }
@@ -998,10 +1051,10 @@ async function computeProductionStage(
     }
 
     // --- Q14 production / QC waste (multi-waste).
-    // Emissions: EVERY filled Q14 row → (qty→kg ÷ Q10b) × that row's EF, then sum.
+    // kg/tonnes: factory qty × componentShare (B103) ÷ Q10b × EF, then sum.
     // Deployed scrap (Q8) uses material-matching rows only — see scrapPerBomRowKg.
     let wasteFossil = 0; // Q14-only, for the 5-bucket breakdown
-    const q14Filled = q14FilledRows(data);
+    const q14Filled = q14ActiveRows(data);
     if (q14Filled.length) {
         const scrapsForDeployed = scrapPerBomRowKg(data);
         (data.q8_bom ?? []).forEach((bom, i) => {
@@ -1018,9 +1071,11 @@ async function computeProductionStage(
         );
 
         for (const q14Row of q14Filled) {
+            const share = componentFactoryWeightShare(data, q14Row.product_id_or_mpn);
+            const factoryWasteKg = q14FactoryQtyKg(data, q14Row);
             const wastePerComponentKg = q14WastePerComponentKg(data, q14Row);
             if (wastePerComponentKg <= 0) {
-                dbg(`   [Q14] skip row id=${q14Row.id}: no per-comp kg (check Q10b / qty)`);
+                dbg(`   [Q14] skip row id=${q14Row.id}: no per-comp kg (check Q10a/Q10b / qty)`);
                 continue;
             }
             const ef_ = await ef({
@@ -1044,8 +1099,17 @@ async function computeProductionStage(
             wasteFossil += contrib;
             const label =
                 q14Row.specific_type || q14Row.group_name || q14Row.waste_type || q14Row.category || "waste";
+            const { isPercent } = q14UnitFlags(q14Row);
+            const usedDefault10 = num(q14Row.quantity) <= 0;
             dbg(
-                `   [Q14] ${label}: ${wastePerComponentKg.toFixed(6)}kg/comp × EF ${ef_} = ${contrib.toFixed(6)}` +
+                `   [Q14] ${label}: ` +
+                (usedDefault10
+                    ? `default 10% × Q10a → factory=${factoryWasteKg.toFixed(4)}kg`
+                    : isPercent
+                      ? `${num(q14Row.quantity)}% × Q10a → factory=${factoryWasteKg.toFixed(4)}kg`
+                      : `factory=${factoryWasteKg.toFixed(4)}kg`) +
+                (share > 0 ? ` × share=${(share * 100).toFixed(2)}%` : "") +
+                ` → ${wastePerComponentKg.toFixed(6)}kg/comp × EF ${ef_} = ${contrib.toFixed(6)}` +
                 (q14IsMaterialScrapForDeployed(q14Row, data.q8_bom ?? []) ? " [deployed]" : " [emissions-only]")
             );
         }
